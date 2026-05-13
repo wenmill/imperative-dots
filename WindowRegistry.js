@@ -1,5 +1,19 @@
 .pragma library
 
+// Helper to check if a QML file actually exists to prevent Loader errors
+function fileExists(path) {
+    if (!path || path === "") return false;
+    let url = Qt.resolvedUrl(path);
+    let request = new XMLHttpRequest();
+    request.open("HEAD", url, false);
+    try {
+        request.send();
+        return request.status === 200;
+    } catch (e) {
+        return false;
+    }
+}
+
 function getScale(mw, userScale) {
     if (mw <= 0) return 1.0;
     let r = mw / 1920.0;
@@ -44,9 +58,16 @@ function getLayout(name, mx, my, mw, mh, userScale) {
         "hidden":    { w: 1, h: 1, rx: -5000 - mx, ry: -5000 - my, comp: "" } 
     };
 
-    if (!base[name]) return null;
-    
     let t = base[name];
+    if (!t) return null;
+
+    // Safety Check: If the file is missing, return a 'hidden' state instead
+    // of a broken path to prevent Loader from crashing or hanging.
+    if (t.comp !== "" && !fileExists(t.comp)) {
+        console.warn("Registry: Missing QML file for " + name + " at " + t.comp);
+        return base["hidden"];
+    }
+    
     t.x = mx + t.rx;
     t.y = my + t.ry;
     
