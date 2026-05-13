@@ -1,0 +1,13 @@
+{
+    "api_key": "PASTE_LITELLM_KEY_HERE",
+    "model": "local",
+    "base_url": "http://localhost:4000",
+    "lichess_token": "",
+    "kavita_url": "http://localhost:5000",
+    "kavita_api_key": "",
+    "obsidian_vault": "",
+    "hermes_enabled": true,
+    "hermes_endpoint": "http://localhost:5400/api/agent",
+    "hermes_token": "",
+    "approval_policy": "ask"
+}
