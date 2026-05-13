@@ -11,8 +11,6 @@ Item {
     id: window
     focus: true
 
-    Caching { id: paths }
-
     Scaler {
         id: scaler
         currentWidth: Screen.width
@@ -53,8 +51,19 @@ Item {
         property string lastEthJson: ""
     }
 
-    readonly property string cacheDir: paths.getCacheDir("network")
+    readonly property string cacheDir: Quickshell.env("XDG_RUNTIME_DIR") ? (Quickshell.env("XDG_RUNTIME_DIR") + "/qs_network") : (Quickshell.env("HOME") + "/.cache/qs_network")
     readonly property string modeFilePath: cacheDir + "/mode"
+
+    // ── VPN state ──
+    property string vpnStatus: "disconnected" // disconnected, connecting, connected
+    property string vpnName: ""
+    property string vpnIp: ""
+    property string currentDns: ""
+    property bool editingIp: false
+    property bool editingDns: false
+    property string editIpText: ""
+    property string editDnsText: ""
+    property string editConnName: ""
 
     property bool ethPresent: false
     property bool wifiPresent: false
@@ -127,7 +136,12 @@ Item {
     Component.onCompleted: {
         window.powerAnimAllowed = false;
         powerAnimBlocker.restart();
-        Quickshell.execDetached(["bash", "-c", "mkdir -p '" + window.cacheDir + "'; if [ ! -f '" + window.modeFilePath + "' ]; then echo '" + activeMode + "' > '" + window.modeFilePath + "'; fi"]);
+        // Use argv form — no shell, no quoting bugs even though these vars are
+        // currently constants. Defense in depth.
+        Quickshell.execDetached(["mkdir", "-p", window.cacheDir]);
+        Quickshell.execDetached(["sh", "-c",
+            'test -f "$1" || printf "%s\n" "$2" > "$1"',
+            "_", window.modeFilePath, activeMode]);
         
         let hasCache = false;
         if (cache.lastEthJson !== "") { processEthJson(cache.lastEthJson, true); hasCache = true; }
@@ -240,7 +254,7 @@ Item {
                 window.playSfx("error.wav"); 
                 
                 if (window.activeMode === "wifi" && targetSsid !== "") {
-                    Quickshell.execDetached(["bash", "-c", "nmcli connection delete '" + targetSsid + "' 2>/dev/null"]);
+                    Quickshell.execDetached(["nmcli", "connection", "delete", targetSsid]);
                     let newSaved = [];
                     for(let i = 0; i < window.savedWifiNetworks.length; i++) {
                         if(window.savedWifiNetworks[i] !== targetSsid) {
@@ -356,7 +370,10 @@ Item {
 
     onActiveModeChanged: {
         if (!window.ignoreNextModeFileUpdate) {
-            Quickshell.execDetached(["bash", "-c", "mkdir -p '" + window.cacheDir + "' && echo '" + window.activeMode + "' > '" + window.modeFilePath + "'"]);
+            // argv form — activeMode is bounded to ["normal","vpn",...] but defend anyway
+            Quickshell.execDetached(["sh", "-c",
+                'printf "%s\n" "$1" > "$2"',
+                "_", window.activeMode, window.modeFilePath]);
         }
         window.ignoreNextModeFileUpdate = false;
         
@@ -513,14 +530,16 @@ Item {
                 }
 
                 if (window.activeMode === "eth") {
-                    nodes.push({ id: "ip", name: obj.ip || "No IP", icon: "󰩟", action: "IP Address", isInfoNode: true, isActionable: true, parentIndex: cIndex });
+                    nodes.push({ id: "ip", name: obj.ip || "No IP", icon: "󰩟", action: "Click to edit", isInfoNode: true, isActionable: true, cmdStr: "EDIT_IP", parentIndex: cIndex });
+                    nodes.push({ id: "dns", name: window.currentDns || "Auto", icon: "󰇖", action: "Click to edit", isInfoNode: true, isActionable: true, cmdStr: "EDIT_DNS", parentIndex: cIndex });
                     nodes.push({ id: "spd", name: obj.speed || "Unknown", icon: "󰓅", action: "Link Speed", isInfoNode: true, isActionable: false, parentIndex: cIndex });
                     nodes.push({ id: "mac", name: obj.mac || "Unknown", icon: "󰒋", action: "MAC Address", isInfoNode: true, isActionable: false, parentIndex: cIndex });
                 } else if (window.activeMode === "wifi") {
                     let sigValue = obj.signal !== undefined ? obj.signal + "%" : "Calculating...";
                     nodes.push({ id: "sig_" + i, name: sigValue, icon: obj.icon || "󰤨", action: "Signal Strength", isInfoNode: true, isActionable: false, parentIndex: cIndex });
                     nodes.push({ id: "sec_" + i, name: obj.security || "Open", icon: "󰦝", action: "Security", isInfoNode: true, isActionable: false, parentIndex: cIndex });
-                    if (obj.ip) nodes.push({ id: "ip_" + i, name: obj.ip, icon: "󰩟", action: "IP Address", isInfoNode: true, isActionable: true, parentIndex: cIndex });
+                    if (obj.ip) nodes.push({ id: "ip_" + i, name: obj.ip, icon: "󰩟", action: "Click to edit", isInfoNode: true, isActionable: true, cmdStr: "EDIT_IP", parentIndex: cIndex });
+                    nodes.push({ id: "dns_" + i, name: window.currentDns || "Auto", icon: "󰇖", action: "Click to edit", isInfoNode: true, isActionable: true, cmdStr: "EDIT_DNS", parentIndex: cIndex });
                     if (obj.freq) nodes.push({ id: "freq_" + i, name: obj.freq, icon: "󰖧", action: "Band", isInfoNode: true, isActionable: false, parentIndex: cIndex });
                 } else {
                     nodes.push({ id: "bat_" + obj.mac, name: (obj.battery || "0") + "%", icon: "󰥉", action: "Battery", isInfoNode: true, isActionable: false, parentIndex: cIndex });
@@ -1478,7 +1497,7 @@ Item {
 
                                     centralCore.disconnectTriggered = true;
                                     centralCore.flashOpacity = 0.6;
-                                    coreFlashAnim.start();
+                                    cardFlashAnim.start();
                                     coreBumpAnim.start();
                                     
                                     window.playSfx("disconnect.wav");
@@ -1659,7 +1678,7 @@ Item {
                                 
                                 property bool isPairedBT: window.activeMode === "bt" && action === "Connect"
                                 property bool isTargetWifi: window.activeMode === "wifi" && !window.isWifiConn && itemId === window.targetWifiSsid
-                                property bool isSpecialAction: itemId === "action_scan" || itemId === "action_settings" || itemId === "ip_0"
+                                property bool isSpecialAction: itemId === "action_scan" || itemId === "action_settings"
                                 property bool isHighlighted: isPairedBT || isTargetWifi || isSpecialAction
                                 
                                 property bool isCurrentlyConnected: {
@@ -1923,7 +1942,7 @@ Item {
                                             font.family: "JetBrains Mono"
                                             font.pixelSize: window.s(10)
                                             color: floatCard.isFailed ? window.maroon : (floatCard.isMyBusy ? window.activeColor : window.overlay0)
-                                            text: floatCard.isFailed ? "Connection Failed" : (floatCard.isMyBusy ? "Connecting..." : (floatCard.renderFill > 0.1 && floatCard.renderFill < 1.0 ? floatCard.itemId === "ip_0" ? floatCard.triggered ? "Copied!" : "Hold to copy...": "Hold..." : action))
+                                            text: floatCard.isFailed ? "Connection Failed" : (floatCard.isMyBusy ? "Connecting..." : (floatCard.renderFill > 0.1 && floatCard.renderFill < 1.0 ? "Hold..." : action))
                                             Behavior on color { ColorAnimation { duration: 200 } }
                                         }
                                     }
@@ -1971,7 +1990,7 @@ Item {
                                             }
                                             Text {
                                                 font.family: "JetBrains Mono"; font.pixelSize: window.s(10); color: window.crust
-                                                text: floatCard.isMyBusy ? "Connecting..." : (floatCard.renderFill > 0.1 && floatCard.renderFill < 1.0 ? floatCard.itemId === "ip_0" ? floatCard.triggered ? "Copied!" : "Hold to copy..." : "Hold..." : action)
+                                                text: floatCard.isMyBusy ? "Connecting..." : (floatCard.renderFill > 0.1 && floatCard.renderFill < 1.0 ? "Hold..." : action)
                                             }
                                         }
                                     }
@@ -2014,18 +2033,12 @@ Item {
                                         cardFlashAnim.start();
                                         cardBumpAnim.start();
                                         
+                                        if (cmdStr === "EDIT_IP") { window.handleEditIp(); return; }
+                                        if (cmdStr === "EDIT_DNS") { window.handleEditDns(); return; }
                                         if (cmdStr === "TOGGLE_VIEW") {
                                             window.playSfx("switch.wav");
                                             window.showInfoView = !window.showInfoView;
                                             floatCard.triggered = false;
-                                            drainAnim.start();
-                                        } else if (isInfoNode && action === "IP Address") {
-                                            if (name && name !== "No IP" && name !== "Unknown") {
-                                                window.playSfx("switch.wav");
-                                                let safeIp = name.replace(/'/g, "'\\''");
-                                                Quickshell.execDetached(["bash", "-c", "printf '%s' '" + safeIp + "' | wl-copy"]);
-                                            }
-                                            floatCard.triggered = true;
                                             drainAnim.start();
                                         } else if (isInfoNode && cmdStr) {
                                             Quickshell.execDetached(["sh", "-c", cmdStr]);
@@ -2057,11 +2070,6 @@ Item {
                                     to: 0.0
                                     duration: 1500 * floatCard.fillLevel 
                                     easing.type: Easing.OutQuad
-                                    onFinished: {
-                                        if (isInfoNode && action === "IP Address") {
-                                            floatCard.triggered = false;
-                                        }
-                                    }
                                 }
                             }
                         }
@@ -2222,6 +2230,176 @@ Item {
                                     window.activeMode = "bt";
                                 }
                             }
+                        }
+                    }
+                }
+            }
+
+            // ── VPN status bar ──
+            Rectangle {
+                id: vpnBar
+                z: 50
+                width: window.s(200); height: window.s(36)
+                anchors.left: parent.left; anchors.leftMargin: window.s(20)
+                anchors.bottom: parent.bottom; anchors.bottomMargin: window.s(20)
+                radius: window.s(10)
+                color: vpnBarMa.containsMouse ? window.surface1 : window.surface0
+                border.color: window.vpnStatus === "connected" ? Qt.rgba(window.green.r, window.green.g, window.green.b, 0.4) : window.surface1
+                border.width: 1
+                Behavior on color { ColorAnimation { duration: 120 } }
+
+                RowLayout {
+                    anchors.fill: parent; anchors.leftMargin: window.s(10); anchors.rightMargin: window.s(10)
+                    spacing: window.s(8)
+
+                    // VPN icon
+                    Text {
+                        text: window.vpnStatus === "connected" ? "󰦝" : "󰦞"
+                        font.family: "Iosevka Nerd Font"; font.pixelSize: window.s(16)
+                        color: window.vpnStatus === "connected" ? window.green : window.overlay1
+                    }
+
+                    // VPN info
+                    ColumnLayout {
+                        Layout.fillWidth: true; spacing: -1
+                        Text {
+                            text: window.vpnStatus === "connected" ? window.vpnName : "VPN Off"
+                            font.family: "JetBrains Mono"; font.weight: Font.Bold; font.pixelSize: window.s(10)
+                            color: window.vpnStatus === "connected" ? window.text : window.subtext0
+                            elide: Text.ElideRight; Layout.fillWidth: true
+                        }
+                        Text {
+                            visible: window.vpnStatus === "connected" && window.vpnIp !== ""
+                            text: window.vpnIp
+                            font.family: "JetBrains Mono"; font.pixelSize: window.s(8)
+                            color: window.overlay1
+                        }
+                    }
+                }
+
+                MouseArea {
+                    id: vpnBarMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                        if (window.vpnStatus === "connected") {
+                            Quickshell.execDetached(["nmcli", "connection", "down", window.vpnName]);
+                            window.vpnStatus = "disconnected";
+                        } else {
+                            // Connect to first available VPN
+                            Quickshell.execDetached(["bash", "-c",
+                                "VPN=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | grep vpn | head -1 | cut -d: -f1); " +
+                                "[ -n \"$VPN\" ] && nmcli connection up \"$VPN\""
+                            ]);
+                            window.vpnStatus = "connecting";
+                        }
+                        vpnPoller.running = true;
+                    }
+                }
+            }
+
+            // ── Settings button ──
+            Rectangle {
+                z: 50
+                width: window.s(36); height: window.s(36)
+                anchors.left: vpnBar.right; anchors.leftMargin: window.s(8)
+                anchors.bottom: parent.bottom; anchors.bottomMargin: window.s(20)
+                radius: window.s(10)
+                color: settingsMa.containsMouse ? window.surface1 : window.surface0
+                border.color: settingsMa.containsMouse ? window.mauve : window.surface1; border.width: 1
+                Behavior on color { ColorAnimation { duration: 120 } }
+
+                Text {
+                    anchors.centerIn: parent; text: "󰒓"
+                    font.family: "Iosevka Nerd Font"; font.pixelSize: window.s(18)
+                    color: settingsMa.containsMouse ? window.mauve : window.overlay1
+                    Behavior on color { ColorAnimation { duration: 150 } }
+                }
+                MouseArea {
+                    id: settingsMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                    onClicked: Quickshell.execDetached(["bash", "-c", "nm-connection-editor &"])
+                }
+            }
+
+            // ── IP edit overlay ──
+            Rectangle {
+                visible: window.editingIp
+                z: 200; anchors.centerIn: parent
+                width: window.s(300); height: window.s(120)
+                radius: window.s(14); color: window.base
+                border.color: window.mauve; border.width: 2
+
+                ColumnLayout {
+                    anchors.fill: parent; anchors.margins: window.s(14); spacing: window.s(10)
+                    Text { text: "Set IP Address"; font.family: "JetBrains Mono"; font.weight: Font.Bold; font.pixelSize: window.s(13); color: window.text }
+                    Rectangle {
+                        Layout.fillWidth: true; Layout.preferredHeight: window.s(32)
+                        radius: window.s(8); color: window.surface0; border.color: ipInput.activeFocus ? window.mauve : window.surface1; border.width: 1
+                        TextInput {
+                            id: ipInput; anchors.fill: parent; anchors.margins: window.s(8)
+                            font.family: "JetBrains Mono"; font.pixelSize: window.s(12); color: window.text
+                            verticalAlignment: TextInput.AlignVCenter; selectByMouse: true
+                            text: window.editIpText
+                            Text { anchors.fill: parent; verticalAlignment: Text.AlignVCenter; visible: !ipInput.text && !ipInput.activeFocus; text: "e.g. 192.168.1.100 or auto"; font: ipInput.font; color: window.overlay0 }
+                            Keys.onReturnPressed: window.applyIp(text)
+                            Keys.onEscapePressed: window.editingIp = false
+                        }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true; spacing: window.s(8)
+                        Rectangle {
+                            Layout.fillWidth: true; Layout.preferredHeight: window.s(28); radius: window.s(6)
+                            color: cancelIpMa.containsMouse ? window.surface1 : window.surface0
+                            Text { anchors.centerIn: parent; text: "Cancel"; font.family: "JetBrains Mono"; font.pixelSize: window.s(10); color: window.subtext0 }
+                            MouseArea { id: cancelIpMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: window.editingIp = false }
+                        }
+                        Rectangle {
+                            Layout.fillWidth: true; Layout.preferredHeight: window.s(28); radius: window.s(6)
+                            color: applyIpMa.containsMouse ? Qt.rgba(window.mauve.r, window.mauve.g, window.mauve.b, 0.2) : window.surface0
+                            border.color: applyIpMa.containsMouse ? window.mauve : window.surface1; border.width: 1
+                            Text { anchors.centerIn: parent; text: "Apply"; font.family: "JetBrains Mono"; font.weight: Font.Bold; font.pixelSize: window.s(10); color: applyIpMa.containsMouse ? window.mauve : window.subtext0 }
+                            MouseArea { id: applyIpMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: window.applyIp(ipInput.text) }
+                        }
+                    }
+                }
+            }
+
+            // ── DNS edit overlay ──
+            Rectangle {
+                visible: window.editingDns
+                z: 200; anchors.centerIn: parent
+                width: window.s(300); height: window.s(120)
+                radius: window.s(14); color: window.base
+                border.color: window.green; border.width: 2
+
+                ColumnLayout {
+                    anchors.fill: parent; anchors.margins: window.s(14); spacing: window.s(10)
+                    Text { text: "Set DNS Server"; font.family: "JetBrains Mono"; font.weight: Font.Bold; font.pixelSize: window.s(13); color: window.text }
+                    Rectangle {
+                        Layout.fillWidth: true; Layout.preferredHeight: window.s(32)
+                        radius: window.s(8); color: window.surface0; border.color: dnsInput.activeFocus ? window.green : window.surface1; border.width: 1
+                        TextInput {
+                            id: dnsInput; anchors.fill: parent; anchors.margins: window.s(8)
+                            font.family: "JetBrains Mono"; font.pixelSize: window.s(12); color: window.text
+                            verticalAlignment: TextInput.AlignVCenter; selectByMouse: true
+                            text: window.editDnsText
+                            Text { anchors.fill: parent; verticalAlignment: Text.AlignVCenter; visible: !dnsInput.text && !dnsInput.activeFocus; text: "e.g. 1.1.1.1 or auto"; font: dnsInput.font; color: window.overlay0 }
+                            Keys.onReturnPressed: window.applyDns(text)
+                            Keys.onEscapePressed: window.editingDns = false
+                        }
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true; spacing: window.s(8)
+                        Rectangle {
+                            Layout.fillWidth: true; Layout.preferredHeight: window.s(28); radius: window.s(6)
+                            color: cancelDnsMa.containsMouse ? window.surface1 : window.surface0
+                            Text { anchors.centerIn: parent; text: "Cancel"; font.family: "JetBrains Mono"; font.pixelSize: window.s(10); color: window.subtext0 }
+                            MouseArea { id: cancelDnsMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: window.editingDns = false }
+                        }
+                        Rectangle {
+                            Layout.fillWidth: true; Layout.preferredHeight: window.s(28); radius: window.s(6)
+                            color: applyDnsMa.containsMouse ? Qt.rgba(window.green.r, window.green.g, window.green.b, 0.2) : window.surface0
+                            border.color: applyDnsMa.containsMouse ? window.green : window.surface1; border.width: 1
+                            Text { anchors.centerIn: parent; text: "Apply"; font.family: "JetBrains Mono"; font.weight: Font.Bold; font.pixelSize: window.s(10); color: applyDnsMa.containsMouse ? window.green : window.subtext0 }
+                            MouseArea { id: applyDnsMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: window.applyDns(dnsInput.text) }
                         }
                     }
                 }
