@@ -1495,6 +1495,8 @@ EOF
     # ────────────────────────────────────────────────────────────────────────
     echo -e "\n${C_CYAN}[ INFO ]${RESET} Setting up Hermes Agent..."
 
+    echo -e "\n${C_CYAN}[ INFO ]${RESET} Setting up Hermes Agent..."
+
     HERMES_HOME="$HOME/.hermes"
     HERMES_CFG="$HERMES_HOME/config.yaml"
     HERMES_ENV="$HERMES_HOME/.env"
@@ -1519,13 +1521,13 @@ EOF
                 if [[ "$yn2" =~ ^[Yy]$ ]]; then
                     # --skip-setup avoids the interactive provider wizard at end
                     # of install — we write our own config.yaml below.
-                    if bash "$tmp_inst" --skip-setup; then
+                    if sudo bash "$tmp_inst" --skip-setup; then
                         printf "  -> Hermes installed %-27s ${C_GREEN}[ OK ]${RESET}\n" ""
                     else
                         printf "  -> Hermes installer non-zero exit %-13s ${C_YELLOW}[WARN]${RESET}\n" ""
                     fi
                 else
-                    echo "  -> Skipped (you can run later: bash $tmp_inst --skip-setup)"
+                    echo "  -> Skipped (you can run later: sudo bash $tmp_inst --skip-setup)"
                 fi
             else
                 printf "  -> Could not fetch installer %-21s ${C_YELLOW}[WARN]${RESET}\n" ""
