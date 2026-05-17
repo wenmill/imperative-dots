@@ -6,7 +6,8 @@
 # Changes vs upstream:
 #   - All telemetry removed (no WORKER_URL, no send_telemetry, no TELEMETRY_ID)
 #   - Added: SearXNG (private metasearch), stealthy-auto-browse (Camoufox MCP)
-#   - Added: Ollama (GPU-aware: cuda / rocm / cpu variant auto-selected)
+#   - Added: Ollama (GPU-aware: cuda / cpu variant auto-selected on non-AMD)
+#   - Added: vLLM-TurboQuant container (replaces Ollama on AMD ROCm systems)
 #   - Added: Hermes Agent (points directly at Ollama), Kavita reading server
 #   - Removed: LiteLLM (no longer in the stack — Hermes talks to Ollama directly)
 #   - Added: SDDM Astronaut theme (replaces upstream's matugen-minimal SDDM theme)
@@ -274,20 +275,22 @@ elif echo "$GPU_INFO" | grep -qi "vmware\|virtualbox\|qxl\|virtio\|bochs"; then
 fi
 
 # ==============================================================================
-# Select correct Ollama variant based on GPU vendor.
+# Select inference backend based on GPU vendor.
 #
-# Arch repos provide:
-#   ollama        — CPU only (fallback)
+# AMD GPUs get vLLM-TurboQuant (containerized) — it outperforms ollama-rocm
+# noticeably on Radeon hardware and TurboQuant KV-cache compression gives
+# ~3-6x effective context length at minimal quality loss. Everyone else gets
+# Ollama, which is simpler and supports a wider model zoo:
+#
 #   ollama-cuda   — NVIDIA CUDA acceleration
-#   ollama-rocm   — AMD ROCm acceleration
-#
-# Intel has no first-class Arch variant (Arc support is experimental and routed
-# through ipex-llm / SYCL). We default Intel boxes to plain `ollama` (CPU).
-# Headless VMs likewise get the CPU build.
+#   ollama        — Intel / VM / unknown (CPU, plus iGPU if it works)
+#   vLLM-TurboQuant container — AMD (skips ollama entirely)
 # ==============================================================================
+USE_VLLM_TURBOQUANT=false
+OLLAMA_PKG=""
 case "$GPU_VENDOR" in
     "NVIDIA") OLLAMA_PKG="ollama-cuda" ;;
-    "AMD")    OLLAMA_PKG="ollama-rocm" ;;
+    "AMD")    USE_VLLM_TURBOQUANT=true ;;
     "INTEL")  OLLAMA_PKG="ollama" ;;
     *)        OLLAMA_PKG="ollama" ;;
 esac
@@ -331,7 +334,11 @@ EOF
     printf "\033[K${BOLD} OS:             ${RESET} %s\n" "$OS_NAME"
     printf "\033[K${BOLD} CPU:            ${RESET} %s\n" "$CPU_INFO"
     printf "\033[K${BOLD} GPU:            ${RESET} %s ${DIM}(%s)${RESET}\n" "$GPU_INFO" "$GPU_VENDOR"
-    printf "\033[K${BOLD} Ollama variant: ${RESET} %s\n" "$OLLAMA_PKG"
+    if [ "$USE_VLLM_TURBOQUANT" = true ]; then
+        printf "\033[K${BOLD} Inference:      ${RESET} vLLM-TurboQuant (ROCm container)\n"
+    else
+        printf "\033[K${BOLD} Inference:      ${RESET} Ollama (%s)\n" "$OLLAMA_PKG"
+    fi
     printf "\033[K${C_BLUE} -----------------------------------------------------------------${RESET}\n"
     printf "\033[K${BOLD} Server Version: ${RESET} %s\n" "$DOTS_VERSION"
     printf "\033[K${BOLD} Local Version:  ${RESET} %s\n" "${LOCAL_VERSION:-Not Installed}"
@@ -620,7 +627,11 @@ show_overview() {
     echo ""
     echo -e "${BOLD}${C_BLUE}--- AI / Ollama / Hermes ---${RESET}"
     print_kb "ai_config.json" "API key, model, lichess + kavita keys"
-    print_kb "Ollama" "http://localhost:11434 (GPU-aware local models)"
+    if [ "$USE_VLLM_TURBOQUANT" = true ]; then
+        print_kb "vLLM-TurboQuant" "http://localhost:8000 (AMD ROCm container)"
+    else
+        print_kb "Ollama" "http://localhost:11434 (GPU-aware local models)"
+    fi
     print_kb "SearXNG" "http://localhost:8888 (private metasearch, JSON)"
     print_kb "autobrowse" "http://localhost:8080 (Camoufox stealth MCP)"
     print_kb "Hermes" "Approval-based shell tool execution"
@@ -685,7 +696,11 @@ manage_ai_stack() {
         draw_header
         echo -e "${BOLD}${C_CYAN}=== AI Stack Configuration ===${RESET}\n"
         echo -e "Installs and wires together:"
-        echo -e "  ${C_GREEN}Ollama${RESET}     — local model server (port 11434, ${BOLD}$OLLAMA_PKG${RESET})"
+        if [ "$USE_VLLM_TURBOQUANT" = true ]; then
+            echo -e "  ${C_GREEN}vLLM-TurboQuant${RESET} — ROCm inference container (port 8000)"
+        else
+            echo -e "  ${C_GREEN}Ollama${RESET}     — local model server (port 11434, ${BOLD}$OLLAMA_PKG${RESET})"
+        fi
         echo -e "  ${C_GREEN}SearXNG${RESET}    — private metasearch, JSON-only (port 8888)"
         echo -e "  ${C_GREEN}autobrowse${RESET} — Camoufox stealth browser MCP (port 8080)"
         echo -e "  ${C_GREEN}Hermes${RESET}     — agent that uses Ollama for tool calls"
@@ -820,8 +835,9 @@ prompt_optional_features_menu() {
 
             # If AI is enabled, append the GPU-appropriate Ollama variant.
             # Done here (not in ARCH_PKGS) so it tracks the user's final OPT_AI
-            # decision after they've toggled it in the menu.
-            if [ "$OPT_AI" = true ]; then
+            # decision after they've toggled it in the menu. Skipped on AMD —
+            # vLLM-TurboQuant runs in a container, no pacman package needed.
+            if [ "$OPT_AI" = true ] && [ -n "$OLLAMA_PKG" ]; then
                 PKGS+=("$OLLAMA_PKG")
             fi
             return 0
@@ -839,7 +855,7 @@ if [ "$HEADLESS" = "true" ]; then
     INSTALL_SDDM=true
     SETUP_SDDM_THEME=true
     PKGS+=("sddm")
-    PKGS+=("$OLLAMA_PKG")
+    [ -n "$OLLAMA_PKG" ] && PKGS+=("$OLLAMA_PKG")
     DRIVER_CHOICE="Skipped (headless)"
     KEEP_OLD_ENV=true
     WEATHER_API_KEY="Skipped"
@@ -949,15 +965,20 @@ for cpkg in "${CONFLICTING_PKGS[@]}"; do
 done
 
 # Resolve ollama-* variant conflicts before install.
-# Switching from one variant to another (e.g. ollama -> ollama-cuda) requires
-# removing the current one first, otherwise pacman refuses with "package
-# conflicts with X". We only touch this when AI is enabled and the variant
-# differs from what's already installed.
+# Switching variants (e.g. ollama -> ollama-cuda) requires removing the current
+# one first, otherwise pacman refuses with "package conflicts with X". Also
+# removes ALL ollama variants when switching to vLLM-TurboQuant (AMD path) so
+# we don't end up with both running.
 if [ "$OPT_AI" = true ]; then
     for variant in ollama ollama-cuda ollama-rocm; do
         if pacman -Qq "$variant" &>/dev/null && [ "$variant" != "$OLLAMA_PKG" ]; then
-            echo -e "  -> ${C_YELLOW}Removing old Ollama variant '$variant' (replacing with $OLLAMA_PKG)...${RESET}"
+            if [ "$USE_VLLM_TURBOQUANT" = true ]; then
+                echo -e "  -> ${C_YELLOW}Removing Ollama '$variant' (switching to vLLM-TurboQuant)...${RESET}"
+            else
+                echo -e "  -> ${C_YELLOW}Removing old Ollama variant '$variant' (replacing with $OLLAMA_PKG)...${RESET}"
+            fi
             sudo systemctl stop ollama.service 2>/dev/null || true
+            sudo systemctl disable ollama.service 2>/dev/null || true
             sudo pacman -Rns --noconfirm "$variant" > /dev/null 2>&1 || true
         fi
     done
@@ -1609,11 +1630,125 @@ fi
 # which Hermes treats as an OpenAI-compatible custom provider at /v1.
 # ==============================================================================
 
-if [ "$OPT_AI" = true ]; then
-    # ─── 6.6 Ollama ────────────────────────────────────────────────────────
-    # The correct variant (ollama / ollama-cuda / ollama-rocm) was already
-    # appended to PKGS earlier in this script and installed by the main
-    # package loop. This block just enables the service and waits for it.
+# AI STACK: (Ollama OR vLLM-TurboQuant) → Hermes → Kavita
+# LiteLLM was removed. Hermes talks directly to whichever inference engine is
+# active (Ollama for NVIDIA/Intel/CPU, vLLM-TurboQuant for AMD) via that
+# engine's OpenAI-compatible HTTP API.
+# ==============================================================================
+
+if [ "$OPT_AI" = true ] && [ "$USE_VLLM_TURBOQUANT" = true ]; then
+    # ─── 6.6a vLLM-TurboQuant (AMD ROCm) ───────────────────────────────────
+    # Runs vLLM with TurboQuant KV-cache compression in a podman container.
+    # Image: ROCm-built upstream vLLM (TurboQuant landed in v0.20). Exposes
+    # OpenAI-compatible API at 127.0.0.1:8000 — Hermes points here.
+    #
+    # The model is loaded at container start and held in VRAM. To change it,
+    # edit the Exec= line in vllm-turboquant.container and restart the unit.
+    echo -e "\n${C_CYAN}[ INFO ]${RESET} Setting up vLLM-TurboQuant (ROCm inference container)..."
+
+    VLLM_QUADLET="$QUADLET_DIR/vllm-turboquant.container"
+    VLLM_MODEL="${VLLM_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
+    VLLM_IMAGE="docker.io/rocm/vllm:latest"
+    VLLM_HF_CACHE_VOL="vllm-hf-cache"
+
+    # Verify ROCm device nodes are present — vLLM-ROCm needs /dev/kfd and /dev/dri.
+    # If they're missing (no amdgpu driver, headless VM, etc.) we still write
+    # the quadlet but warn loudly; the user can fix drivers and `systemctl --user
+    # restart vllm-turboquant`.
+    if [ ! -e /dev/kfd ] || ! ls /dev/dri/renderD* &>/dev/null; then
+        printf "  -> ${C_YELLOW}/dev/kfd or /dev/dri/renderD* missing — install AMD drivers first${RESET}\n"
+        printf "  -> ${DIM}Re-run this script after: paru -S rocm-hip-runtime rocm-smi-lib${RESET}\n"
+    fi
+
+    # Pull the image up front
+    if command -v podman &>/dev/null; then
+        echo "  -> Pulling vLLM ROCm image ($VLLM_IMAGE) — this is multi-GB, be patient..."
+        if podman pull "$VLLM_IMAGE" 2>&1 | tail -3; then
+            printf "  -> vLLM ROCm image pulled %-22s ${C_GREEN}[ OK ]${RESET}\n" ""
+        else
+            printf "  -> vLLM ROCm image pull failed %-17s ${C_YELLOW}[WARN]${RESET}\n" ""
+            echo "  -> ${DIM}Try manually: podman pull $VLLM_IMAGE${RESET}"
+        fi
+    fi
+
+    cat > "$VLLM_QUADLET" <<EOF
+[Unit]
+Description=vLLM-TurboQuant inference server (ROCm, OpenAI-compatible at :8000)
+After=network-online.target
+
+[Container]
+Image=$VLLM_IMAGE
+ContainerName=vllm-turboquant
+# OpenAI-compatible API. Hermes + ai_config.json point here.
+PublishPort=127.0.0.1:8000:8000
+# ROCm device passthrough — must be ungated for the container to see the GPU.
+AddDevice=/dev/kfd
+AddDevice=/dev/dri
+# Required groups for /dev/kfd and /dev/dri access inside the container.
+GroupAdd=keep-groups
+# Shared memory bump — vLLM needs more than the podman default (64MB).
+ShmSize=8g
+# Persistent HF model cache so we don't re-download $VLLM_MODEL on every restart.
+Volume=$VLLM_HF_CACHE_VOL:/root/.cache/huggingface
+Environment=HF_HUB_ENABLE_HF_TRANSFER=1
+# TurboQuant + ROCm AITER kernels. Tune as needed for your card.
+Environment=VLLM_ROCM_USE_AITER=1
+# vLLM serve args — change --model to swap inference target.
+# turboquant_4bit_nc is the recommended KV-cache dtype on consumer Radeon.
+Exec=--model $VLLM_MODEL --host 0.0.0.0 --port 8000 \\
+     --kv-cache-dtype turboquant_4bit_nc \\
+     --gpu-memory-utilization 0.85 \\
+     --max-model-len 8192 \\
+     --enable-auto-tool-choice \\
+     --tool-call-parser hermes
+AutoUpdate=registry
+
+[Service]
+Restart=always
+# vLLM startup pulls the model into VRAM — can take 60-120s on a cold start.
+TimeoutStartSec=600
+
+[Install]
+WantedBy=default.target
+EOF
+    chmod 644 "$VLLM_QUADLET"
+    printf "  -> vllm-turboquant quadlet written %-12s ${C_GREEN}[ OK ]${RESET}\n" ""
+
+    systemctl --user daemon-reload
+    if systemctl --user enable --now vllm-turboquant.service 2>/dev/null; then
+        printf "  -> vllm-turboquant.service enabled %-13s ${C_GREEN}[ OK ]${RESET}\n" ""
+    else
+        printf "  -> vllm-turboquant.service failed %-13s ${C_YELLOW}[WARN]${RESET}\n" ""
+        printf "  -> ${DIM}Check: journalctl --user -xeu vllm-turboquant${RESET}\n"
+    fi
+
+    # First-time model download can take 5-15min — don't block the rest of the
+    # script on it. Just probe briefly so user knows whether it's responding.
+    echo "  -> Probing vLLM endpoint (model may still be downloading)..."
+    vllm_up=false
+    for i in $(seq 1 15); do
+        if curl -fsS -m 1 http://localhost:8000/v1/models &>/dev/null; then
+            printf "  -> vLLM responding at :8000 %-19s ${C_GREEN}[ OK ]${RESET}\n" ""
+            vllm_up=true
+            break
+        fi
+        sleep 1
+    done
+    if [ "$vllm_up" = false ]; then
+        printf "  -> vLLM not yet responding %-21s ${C_YELLOW}[WAIT]${RESET}\n" ""
+        echo "  -> ${DIM}Model is still loading. Follow progress:${RESET}"
+        echo "  -> ${BOLD}journalctl --user -fu vllm-turboquant${RESET}"
+    fi
+
+    echo -e "  -> ${C_GREEN}vLLM-TurboQuant active.${RESET} Default model: ${BOLD}$VLLM_MODEL${RESET}"
+    echo -e "  -> ${C_CYAN}OpenAI API:${RESET}    http://localhost:8000/v1"
+    echo -e "  -> ${C_CYAN}Models endpoint:${RESET} curl http://localhost:8000/v1/models"
+    echo -e "  -> ${DIM}To change model, edit Exec= in $VLLM_QUADLET and restart the service.${RESET}"
+
+elif [ "$OPT_AI" = true ]; then
+    # ─── 6.6b Ollama (NVIDIA / Intel / CPU) ────────────────────────────────
+    # The correct variant (ollama / ollama-cuda) was already appended to PKGS
+    # and installed by the main package loop. This block enables the service.
     echo -e "\n${C_CYAN}[ INFO ]${RESET} Setting up Ollama (local model server, variant: ${BOLD}$OLLAMA_PKG${RESET})..."
 
     if command -v ollama &>/dev/null; then
@@ -1643,7 +1778,6 @@ OLLAMAEOF
         # GPU-specific guidance
         case "$GPU_VENDOR" in
             NVIDIA) echo -e "  -> ${C_GREEN}NVIDIA CUDA build active.${RESET} ${BOLD}nvidia-smi${RESET} to verify GPU is visible." ;;
-            AMD)    echo -e "  -> ${C_GREEN}AMD ROCm build active.${RESET} Check ${BOLD}rocminfo${RESET} (may need rocm-smi-lib)." ;;
             INTEL)  echo -e "  -> ${C_YELLOW}Intel GPU: using CPU-only Ollama build.${RESET}"
                     echo -e "     ${DIM}For Intel ARC/Iris XE acceleration, see ipex-llm — not packaged for Arch yet.${RESET}" ;;
             *)      echo -e "  -> ${C_YELLOW}CPU-only Ollama build (VM / unknown GPU).${RESET}" ;;
@@ -1654,7 +1788,9 @@ OLLAMAEOF
         printf "  -> ollama not installed (variant: $OLLAMA_PKG) %-3s ${C_YELLOW}[WARN]${RESET}\n" ""
         echo -e "  -> ${C_YELLOW}Install it manually:${RESET} ${BOLD}$PKG_MANAGER $OLLAMA_PKG${RESET}"
     fi
+fi
 
+if [ "$OPT_AI" = true ]; then
     # ─── 6.8 Hermes Agent ──────────────────────────────────────────────────
     #
     # Hermes is wired directly to Ollama. Hermes treats Ollama's OpenAI-
@@ -1676,30 +1812,20 @@ OLLAMAEOF
     else
         echo -e "  -> ${C_YELLOW}Hermes is third-party (NousResearch).${RESET}"
         echo -e "  -> ${DIM}Installer: $HERMES_INSTALL_URL${RESET}"
-        echo -e "  -> ${DIM}Will run with --skip-setup; we provide config separately.${RESET}"
+        echo -e "  -> ${DIM}Runs as: curl ... | sudo bash -s -- --skip-setup${RESET}"
+        echo -e "  -> ${DIM}--skip-setup avoids their interactive provider wizard; we write config below.${RESET}"
         read -rp "  Install Hermes Agent now? [y/N] " yn
         if [[ "$yn" =~ ^[Yy]$ ]]; then
-            tmp_inst=$(mktemp --suffix=.sh)
-            if curl -fsSL "$HERMES_INSTALL_URL" -o "$tmp_inst"; then
-                echo -e "  -> Saved installer to $tmp_inst"
-                echo -e "  -> SHA-256: $(sha256sum "$tmp_inst" | awk '{print $1}')"
-                echo -e "  -> ${DIM}Review with: less $tmp_inst${RESET}"
-                read -rp "  Proceed with installation? [y/N] " yn2
-                if [[ "$yn2" =~ ^[Yy]$ ]]; then
-                    # --skip-setup avoids the interactive provider wizard at end
-                    # of install — we write our own config.yaml below.
-                    if sudo bash "$tmp_inst" --skip-setup; then
-                        printf "  -> Hermes installed %-27s ${C_GREEN}[ OK ]${RESET}\n" ""
-                    else
-                        printf "  -> Hermes installer non-zero exit %-13s ${C_YELLOW}[WARN]${RESET}\n" ""
-                    fi
-                else
-                    echo "  -> Skipped (you can run later: sudo bash $tmp_inst --skip-setup)"
-                fi
+            # Canonical curl-pipe-sudo-bash. -s -- passes args through to the
+            # downloaded script. set -o pipefail (already set at top of script
+            # if you've enabled it) ensures we catch curl failures.
+            if curl -fsSL "$HERMES_INSTALL_URL" | sudo bash -s -- --skip-setup; then
+                printf "  -> Hermes installed %-27s ${C_GREEN}[ OK ]${RESET}\n" ""
             else
-                printf "  -> Could not fetch installer %-21s ${C_YELLOW}[WARN]${RESET}\n" ""
+                printf "  -> Hermes install failed %-22s ${C_YELLOW}[WARN]${RESET}\n" ""
+                echo "  -> ${DIM}Manual retry:${RESET}"
+                echo "  ->   ${BOLD}curl -fsSL $HERMES_INSTALL_URL | sudo bash -s -- --skip-setup${RESET}"
             fi
-            rm -f "$tmp_inst"
         else
             echo "  -> Skipped Hermes install"
         fi
@@ -1711,17 +1837,26 @@ OLLAMAEOF
         chmod 700 "$HERMES_HOME"
 
         # ── .env ──
-        # Ollama doesn't need a real key, but Hermes requires its custom
-        # provider to reference an env var. We set a dummy "ollama" string.
+        # The inference engine (Ollama or vLLM-TurboQuant) doesn't authenticate,
+        # but Hermes requires its custom provider to reference an env var.
+        # We set a dummy value either way.
         if [ ! -f "$HERMES_ENV" ]; then
+            if [ "$USE_VLLM_TURBOQUANT" = true ]; then
+                _inf_key_line="VLLM_API_KEY=vllm"
+                _inf_url_line="VLLM_BASE_URL=http://localhost:8000/v1"
+                _inf_comment="# vLLM-TurboQuant doesn't authenticate. Any non-empty value works."
+            else
+                _inf_key_line="OLLAMA_API_KEY=ollama"
+                _inf_url_line="OLLAMA_BASE_URL=http://localhost:11434/v1"
+                _inf_comment="# Ollama doesn't authenticate. Any non-empty value works."
+            fi
             cat > "$HERMES_ENV" <<ENVEOF
 # Hermes environment — auto-generated by install.sh.
 # Keep real API keys here, NOT in config.yaml.
 
-# Ollama doesn't authenticate, but Hermes wants an env var.
-# Any non-empty value works.
-OLLAMA_API_KEY=ollama
-OLLAMA_BASE_URL=http://localhost:11434/v1
+$_inf_comment
+$_inf_key_line
+$_inf_url_line
 
 # autobrowse MCP token (used by the MCP registration below).
 AUTOBROWSE_AUTH_TOKEN=$AUTOBROWSE_AUTH_TOKEN
@@ -1741,28 +1876,41 @@ ENVEOF
         fi
 
         # ── config.yaml ──
-        # Inference points at our local Ollama via the OpenAI-compatible /v1
-        # endpoint. Change `model:` to whatever you `ollama pull`'d.
+        # Inference points at our local engine via its OpenAI-compatible
+        # endpoint (Ollama :11434/v1, or vLLM-TurboQuant :8000/v1 on AMD).
         if [ ! -f "$HERMES_CFG" ]; then
+            if [ "$USE_VLLM_TURBOQUANT" = true ]; then
+                _inf_provider="vllm-turboquant"
+                _inf_model="${VLLM_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
+                _inf_base_url="http://localhost:8000/v1"
+                _inf_key_env="VLLM_API_KEY"
+                _inf_note="# To change model: edit Exec= in vllm-turboquant.container and restart that unit."
+            else
+                _inf_provider="ollama-local"
+                _inf_model="qwen2.5:7b"
+                _inf_base_url="http://localhost:11434/v1"
+                _inf_key_env="OLLAMA_API_KEY"
+                _inf_note="# To change model: \`ollama pull <name>\` then update \`model:\` here."
+            fi
             cat > "$HERMES_CFG" <<YAMLEOF
 # Hermes Agent configuration — auto-generated by install.sh.
 # This file is YAML. Keep API keys in ~/.hermes/.env, NOT here.
 # To regenerate: delete this file and re-run install.sh.
 
 # ── Inference ────────────────────────────────────────────────────────────
-# Talks directly to local Ollama via its OpenAI-compatible endpoint.
-# To use a different model, run \`ollama pull <name>\` and change \`model:\`.
+# Talks directly to the local inference engine via its OpenAI-compatible API.
+$_inf_note
 inference:
-  provider: ollama-local
-  model: qwen2.5:7b
+  provider: $_inf_provider
+  model: $_inf_model
 
 # ── Custom providers ─────────────────────────────────────────────────────
-# Ollama exposes an OpenAI-compatible API at :11434/v1.
-# api_key resolves from OLLAMA_API_KEY in ~/.hermes/.env (dummy value).
+# The local inference engine exposes an OpenAI-compatible API.
+# api_key resolves from $_inf_key_env in ~/.hermes/.env (dummy value).
 custom_providers:
-  - name: ollama-local
-    base_url: http://localhost:11434/v1
-    api_key_env: OLLAMA_API_KEY
+  - name: $_inf_provider
+    base_url: $_inf_base_url
+    api_key_env: $_inf_key_env
     api_format: openai
 
 # ── Terminal tool ────────────────────────────────────────────────────────
@@ -1902,17 +2050,31 @@ EOF
     echo "  -> ${C_CYAN}Get API key:${RESET} Account → API Key → paste into ai_config.json"
 
     # ─── 6.9 AI popup config ───────────────────────────────────────────────
-    # Points the popup at Ollama directly (LiteLLM removed). Also exposes
+    # Points the popup at whichever inference engine is active. Also exposes
     # SearXNG and Kavita URLs so the popup widget can query them.
     AI_CFG="$HOME/.config/hypr/ai_config.json"
     if [ ! -f "$AI_CFG" ]; then
         mkdir -p "$(dirname "$AI_CFG")"
+        if [ "$USE_VLLM_TURBOQUANT" = true ]; then
+            _ai_api_key="vllm"
+            _ai_model="${VLLM_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
+            _ai_base_url="http://localhost:8000/v1"
+            _ai_native_url="http://localhost:8000"
+            _ai_engine="vllm-turboquant"
+        else
+            _ai_api_key="ollama"
+            _ai_model="qwen2.5:7b"
+            _ai_base_url="http://localhost:11434/v1"
+            _ai_native_url="http://localhost:11434"
+            _ai_engine="ollama"
+        fi
         cat > "$AI_CFG" <<JSON
 {
-    "api_key": "ollama",
-    "model": "qwen2.5:7b",
-    "base_url": "http://localhost:11434/v1",
-    "ollama_native_url": "http://localhost:11434",
+    "inference_engine": "$_ai_engine",
+    "api_key": "$_ai_api_key",
+    "model": "$_ai_model",
+    "base_url": "$_ai_base_url",
+    "ollama_native_url": "$_ai_native_url",
     "searxng_url": "http://localhost:8888",
     "lichess_token": "",
     "kavita_url": "http://localhost:5000",
@@ -2113,6 +2275,8 @@ KB_LAYOUTS_DISPLAY="$KB_LAYOUTS_DISPLAY"
 KB_OPTIONS="$KB_OPTIONS"
 WALLPAPER_DIR="$WALLPAPER_DIR"
 OLLAMA_PKG="$OLLAMA_PKG"
+USE_VLLM_TURBOQUANT="$USE_VLLM_TURBOQUANT"
+VLLM_MODEL="${VLLM_MODEL:-}"
 AUTOBROWSE_AUTH_TOKEN="$AUTOBROWSE_AUTH_TOKEN"
 SEARXNG_AI_SECRET="$SEARXNG_AI_SECRET"
 EOF
@@ -2185,7 +2349,11 @@ fi
 
 if [ "$OPT_AI" = true ]; then
     echo -e "${BOLD}AI Stack Summary:${RESET}"
-    echo -e "  ${BOLD}Ollama:${RESET}     ${C_GREEN}http://localhost:11434${RESET}  (variant: ${BOLD}$OLLAMA_PKG${RESET})"
+    if [ "$USE_VLLM_TURBOQUANT" = true ]; then
+        echo -e "  ${BOLD}vLLM-TurboQuant:${RESET} ${C_GREEN}http://localhost:8000/v1${RESET}  (ROCm container, model: ${BOLD}${VLLM_MODEL:-Qwen/Qwen2.5-7B-Instruct}${RESET})"
+    else
+        echo -e "  ${BOLD}Ollama:${RESET}     ${C_GREEN}http://localhost:11434${RESET}  (variant: ${BOLD}$OLLAMA_PKG${RESET})"
+    fi
     echo -e "  ${BOLD}SearXNG:${RESET}    ${C_GREEN}http://localhost:8888${RESET}   (JSON: /search?q=...&format=json)"
     echo -e "  ${BOLD}autobrowse:${RESET} ${C_GREEN}http://localhost:8080${RESET}   (live VNC at :5900)"
     echo -e "  ${BOLD}Kavita:${RESET}     ${C_GREEN}http://localhost:5000${RESET}"
@@ -2210,10 +2378,20 @@ if [ "$GPU_VENDOR" = "VM" ]; then
 fi
 
 echo -e "\nNext steps:"
-echo -e "  1. ${C_GREEN}ollama pull qwen2.5:7b${RESET}  (or whichever model you want as the default)"
+if [ "$USE_VLLM_TURBOQUANT" = true ]; then
+    echo -e "  1. ${C_GREEN}journalctl --user -fu vllm-turboquant${RESET}  (watch model load — first run downloads weights)"
+    echo -e "     ${DIM}To swap model: edit Exec= in ~/.config/containers/systemd/vllm-turboquant.container, then:${RESET}"
+    echo -e "     ${DIM}systemctl --user daemon-reload && systemctl --user restart vllm-turboquant${RESET}"
+else
+    echo -e "  1. ${C_GREEN}ollama pull qwen2.5:7b${RESET}  (or whichever model you want as the default)"
+fi
 echo -e "  2. Edit ${C_GREEN}$HOME/.config/hypr/ai_config.json${RESET} (Lichess + Kavita keys)"
 if command -v hermes &>/dev/null; then
-    echo -e "  3. Run ${C_GREEN}hermes${RESET} once to confirm config (talks to Ollama directly)"
+    if [ "$USE_VLLM_TURBOQUANT" = true ]; then
+        echo -e "  3. Run ${C_GREEN}hermes${RESET} once to confirm config (talks to vLLM-TurboQuant directly)"
+    else
+        echo -e "  3. Run ${C_GREEN}hermes${RESET} once to confirm config (talks to Ollama directly)"
+    fi
 fi
 echo -e "  4. Try SearXNG: ${C_GREEN}curl 'http://localhost:8888/search?q=test&format=json' | jq${RESET}"
 echo -e "  5. ${C_GREEN}sudo reboot${RESET} for SDDM"
