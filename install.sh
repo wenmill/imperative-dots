@@ -5,7 +5,10 @@
 # Layout/structure adapted from ilyamiro/imperative-dots, modified.
 # Changes vs upstream:
 #   - All telemetry removed (no WORKER_URL, no send_telemetry, no TELEMETRY_ID)
-#   - Added: LiteLLM, Ollama, Hermes Agent, Kavita install + wiring
+#   - Added: SearXNG (private metasearch), stealthy-auto-browse (Camoufox MCP)
+#   - Added: Ollama (GPU-aware: cuda / rocm / cpu variant auto-selected)
+#   - Added: Hermes Agent (points directly at Ollama), Kavita reading server
+#   - Removed: LiteLLM (no longer in the stack — Hermes talks to Ollama directly)
 #   - Added: SDDM Astronaut theme (replaces upstream's matugen-minimal SDDM theme)
 #   - Added: AI popup config template
 #   - Added packages: quickshell-git, hyprpolkitagent, uwsm, rust, python-pip,
@@ -111,7 +114,7 @@ OPT_ZSH=false
 OPT_WALLPAPERS=false
 OPT_OVERRIDE_KEYBINDS=false
 OPT_OVERRIDE_STARTUPS=false
-OPT_AI=true     # AI stack (Ollama + LiteLLM + Hermes) — install by default
+OPT_AI=true     # AI stack (Ollama + SearXNG + autobrowse + Hermes) — install by default
 
 INSTALL_NVIM=false
 INSTALL_ZSH=false
@@ -151,6 +154,8 @@ fi
 
 # ==============================================================================
 # Package list — pacman + AUR mixed (the AUR helper handles both)
+# Note: the correct Ollama variant (ollama / ollama-cuda / ollama-rocm) is
+# appended to PKGS dynamically below, after GPU detection, when OPT_AI=true.
 # ==============================================================================
 ARCH_PKGS=(
     # Core compositor + portals + session management
@@ -171,13 +176,10 @@ ARCH_PKGS=(
     # crash if the deps are missing.
     "libxcb" "xcb-util-cursor"
     # AI stack prerequisites
-    # Note: python312 (AUR) is used for the LiteLLM venv because LiteLLM proxy
-    # has uvloop/fastuuid/orjson build issues on Python 3.13+. System python is
-    # left alone — this only affects the LiteLLM virtual environment.
-    "python-pip" "python312" "nodejs" "npm" "rust" "openssl"
+    "python-pip" "nodejs" "npm" "rust" "openssl"
     # Required for SDDM Astronaut theme
     "qt6-svg" "qt6-declarative" "qt6-virtualkeyboard"
-    # Containers
+    # Containers (used by Kavita, SearXNG, stealthy-auto-browse)
     "podman" "fuse-overlayfs" "slirp4netns"
 )
 
@@ -271,6 +273,25 @@ elif echo "$GPU_INFO" | grep -qi "vmware\|virtualbox\|qxl\|virtio\|bochs"; then
     GPU_VENDOR="VM"
 fi
 
+# ==============================================================================
+# Select correct Ollama variant based on GPU vendor.
+#
+# Arch repos provide:
+#   ollama        — CPU only (fallback)
+#   ollama-cuda   — NVIDIA CUDA acceleration
+#   ollama-rocm   — AMD ROCm acceleration
+#
+# Intel has no first-class Arch variant (Arc support is experimental and routed
+# through ipex-llm / SYCL). We default Intel boxes to plain `ollama` (CPU).
+# Headless VMs likewise get the CPU build.
+# ==============================================================================
+case "$GPU_VENDOR" in
+    "NVIDIA") OLLAMA_PKG="ollama-cuda" ;;
+    "AMD")    OLLAMA_PKG="ollama-rocm" ;;
+    "INTEL")  OLLAMA_PKG="ollama" ;;
+    *)        OLLAMA_PKG="ollama" ;;
+esac
+
 EXISTING_SETTINGS="$HOME/.config/hypr/settings.json"
 if [ -f "$EXISTING_SETTINGS" ] && command -v jq &>/dev/null; then
     _sj_lang=$(jq -r 'if has("language") then (.language // "") else "IGNORE_ME" end' "$EXISTING_SETTINGS" 2>/dev/null)
@@ -310,6 +331,7 @@ EOF
     printf "\033[K${BOLD} OS:             ${RESET} %s\n" "$OS_NAME"
     printf "\033[K${BOLD} CPU:            ${RESET} %s\n" "$CPU_INFO"
     printf "\033[K${BOLD} GPU:            ${RESET} %s ${DIM}(%s)${RESET}\n" "$GPU_INFO" "$GPU_VENDOR"
+    printf "\033[K${BOLD} Ollama variant: ${RESET} %s\n" "$OLLAMA_PKG"
     printf "\033[K${C_BLUE} -----------------------------------------------------------------${RESET}\n"
     printf "\033[K${BOLD} Server Version: ${RESET} %s\n" "$DOTS_VERSION"
     printf "\033[K${BOLD} Local Version:  ${RESET} %s\n" "${LOCAL_VERSION:-Not Installed}"
@@ -596,10 +618,13 @@ show_overview() {
     print_kb "SUPER + comma" "Toggle System Settings"
     print_kb "SUPER + A" "Toggle AI popup"
     echo ""
-    echo -e "${BOLD}${C_BLUE}--- AI / LiteLLM / Hermes ---${RESET}"
+    echo -e "${BOLD}${C_BLUE}--- AI / Ollama / Hermes ---${RESET}"
     print_kb "ai_config.json" "API key, model, lichess + kavita keys"
-    print_kb "LiteLLM" "http://localhost:4000 (key in ai_config.json)"
+    print_kb "Ollama" "http://localhost:11434 (GPU-aware local models)"
+    print_kb "SearXNG" "http://localhost:8888 (private metasearch, JSON)"
+    print_kb "autobrowse" "http://localhost:8080 (Camoufox stealth MCP)"
     print_kb "Hermes" "Approval-based shell tool execution"
+    print_kb "Kavita" "http://localhost:5000 (reading server)"
     echo ""
     echo -e "${BOLD}${C_GREEN}Press ENTER to return to the Main Menu...${RESET}"
     read -r
@@ -660,9 +685,11 @@ manage_ai_stack() {
         draw_header
         echo -e "${BOLD}${C_CYAN}=== AI Stack Configuration ===${RESET}\n"
         echo -e "Installs and wires together:"
-        echo -e "  ${C_GREEN}Ollama${RESET}    — local model server (port 11434)"
-        echo -e "  ${C_GREEN}LiteLLM${RESET}   — OpenAI-compatible router (port 4000)"
-        echo -e "  ${C_GREEN}Hermes${RESET}    — agent that uses LiteLLM/Ollama for tool calls\n"
+        echo -e "  ${C_GREEN}Ollama${RESET}     — local model server (port 11434, ${BOLD}$OLLAMA_PKG${RESET})"
+        echo -e "  ${C_GREEN}SearXNG${RESET}    — private metasearch, JSON-only (port 8888)"
+        echo -e "  ${C_GREEN}autobrowse${RESET} — Camoufox stealth browser MCP (port 8080)"
+        echo -e "  ${C_GREEN}Hermes${RESET}     — agent that uses Ollama for tool calls"
+        echo -e "  ${C_GREEN}Kavita${RESET}     — reading server (port 5000)\n"
 
         local current="$( [ "$OPT_AI" = true ] && echo -e "${C_GREEN}ENABLED${RESET}" || echo -e "${DIM}DISABLED${RESET}" )"
         echo -e "Current: ${BOLD}$current${RESET}\n"
@@ -716,7 +743,7 @@ prompt_optional_features_menu() {
         MENU_ITEMS+="2. $S_NVIM Neovim Matugen Configuration\n"
         MENU_ITEMS+="3. $S_ZSH Zsh Shell Setup\n"
         MENU_ITEMS+="4. $S_WP Download FULL Wallpaper Pack (Unchecked = 3 Random)\n"
-        MENU_ITEMS+="5. $S_AI AI Stack (Ollama + LiteLLM + Hermes)\n"
+        MENU_ITEMS+="5. $S_AI AI Stack (Ollama + SearXNG + autobrowse + Hermes)\n"
 
         if [ "$HAS_HISTORY" = true ]; then
             local S_KB_OVR=$( [ "$OPT_OVERRIDE_KEYBINDS" = true ] && echo -e "${C_GREEN}[✓]${RESET}" || echo -e "${DIM}[ ]${RESET}" )
@@ -790,6 +817,13 @@ prompt_optional_features_menu() {
             fi
             [ "$OPT_NVIM" = true ] && { INSTALL_NVIM=true; PKGS+=("neovim" "lua-language-server" "unzip" "nodejs" "npm" "python3"); }
             [ "$OPT_ZSH" = true ] && { INSTALL_ZSH=true; PKGS+=("zsh"); }
+
+            # If AI is enabled, append the GPU-appropriate Ollama variant.
+            # Done here (not in ARCH_PKGS) so it tracks the user's final OPT_AI
+            # decision after they've toggled it in the menu.
+            if [ "$OPT_AI" = true ]; then
+                PKGS+=("$OLLAMA_PKG")
+            fi
             return 0
         fi
     done
@@ -805,6 +839,7 @@ if [ "$HEADLESS" = "true" ]; then
     INSTALL_SDDM=true
     SETUP_SDDM_THEME=true
     PKGS+=("sddm")
+    PKGS+=("$OLLAMA_PKG")
     DRIVER_CHOICE="Skipped (headless)"
     KEEP_OLD_ENV=true
     WEATHER_API_KEY="Skipped"
@@ -912,6 +947,21 @@ for cpkg in "${CONFLICTING_PKGS[@]}"; do
         fi
     fi
 done
+
+# Resolve ollama-* variant conflicts before install.
+# Switching from one variant to another (e.g. ollama -> ollama-cuda) requires
+# removing the current one first, otherwise pacman refuses with "package
+# conflicts with X". We only touch this when AI is enabled and the variant
+# differs from what's already installed.
+if [ "$OPT_AI" = true ]; then
+    for variant in ollama ollama-cuda ollama-rocm; do
+        if pacman -Qq "$variant" &>/dev/null && [ "$variant" != "$OLLAMA_PKG" ]; then
+            echo -e "  -> ${C_YELLOW}Removing old Ollama variant '$variant' (replacing with $OLLAMA_PKG)...${RESET}"
+            sudo systemctl stop ollama.service 2>/dev/null || true
+            sudo pacman -Rns --noconfirm "$variant" > /dev/null 2>&1 || true
+        fi
+    done
+fi
 
 ALL_PKGS=("${PKGS[@]}" "${DRIVER_PKGS[@]}")
 MISSING_PKGS=()
@@ -1307,407 +1357,142 @@ if [ -f "$REPO_DIR/utils/bin/cava" ]; then
 fi
 
 # ==============================================================================
-# AI STACK: Ollama → LiteLLM → Hermes (NEW vs upstream)
+# PRE-AI: shared bootstrapping
+#
+# Auth tokens, secrets, and the quadlet directory are set up here so both the
+# SearXNG and stealthy-auto-browse blocks below — and the AI stack proper —
+# can reference them without re-deriving anything.
 # ==============================================================================
-LITELLM_KEY=""
-
 if [ "$OPT_AI" = true ]; then
-    # Generate autobrowse auth token early so Hermes config can reference it.
-    # If a previous install set one in the version state file, reuse it.
-    if [ -z "${AUTOBROWSE_AUTH_TOKEN:-}" ]; then
-        AUTOBROWSE_AUTH_TOKEN="$(openssl rand -hex 24)"
-    fi
-    # ─── 6.6 Ollama ────────────────────────────────────────────────────────
-    echo -e "\n${C_CYAN}[ INFO ]${RESET} Setting up Ollama (local model server)..."
+    # Reuse tokens from a previous install if present (sourced from VERSION_FILE
+    # at the top of this script). Otherwise mint fresh ones.
+    [ -z "${AUTOBROWSE_AUTH_TOKEN:-}" ] && AUTOBROWSE_AUTH_TOKEN="$(openssl rand -hex 24)"
+    [ -z "${SEARXNG_AI_SECRET:-}" ]     && SEARXNG_AI_SECRET="$(openssl rand -hex 32)"
 
-    if command -v ollama &>/dev/null; then
-        # Lock Ollama to localhost (default binds 0.0.0.0:11434).
-        # Override via systemd drop-in so package updates don't clobber it.
-        sudo mkdir -p /etc/systemd/system/ollama.service.d
-        sudo tee /etc/systemd/system/ollama.service.d/override.conf >/dev/null <<'OLLAMAEOF'
-[Service]
-Environment=OLLAMA_HOST=127.0.0.1:11434
-OLLAMAEOF
-        sudo systemctl daemon-reload
+    QUADLET_DIR="$HOME/.config/containers/systemd"
+    mkdir -p "$QUADLET_DIR"
+fi
 
-        if sudo systemctl enable --now ollama 2>/dev/null; then
-            printf "  -> ollama.service running (localhost only) %-4s ${C_GREEN}[ OK ]${RESET}\n" ""
-        else
-            printf "  -> ollama.service failed %-22s ${C_YELLOW}[WARN]${RESET}\n" ""
-        fi
+# ==============================================================================
+# SearXNG (private metasearch backend for the AI)
+#
+# Runs in a podman container, JSON-only output, configured via a settings.yml
+# we drop on disk and bind-mount read-only into /etc/searxng/settings.yml.
+#
+# Bound to 127.0.0.1:8888 (host) -> 8080 (container). The container is named
+# "searxng-ai" to match the base_url referenced in settings.yml, in case
+# anything else on the same podman network wants to reach it by service name.
+# ==============================================================================
+if [ "$OPT_AI" = true ]; then
+    echo -e "\n${C_CYAN}[ INFO ]${RESET} Setting up SearXNG (private metasearch)..."
 
-        for i in $(seq 1 10); do
-            if curl -fsS -m 1 http://localhost:11434/api/tags &>/dev/null; then
-                printf "  -> Ollama responding %-26s ${C_GREEN}[ OK ]${RESET}\n" ""
-                break
-            fi
-            sleep 1
-        done
-        echo -e "  -> ${C_CYAN}Pull a model with:${RESET} ${BOLD}ollama pull qwen2.5:7b${RESET}"
-    else
-        printf "  -> ollama not installed %-23s ${C_YELLOW}[WARN]${RESET}\n" ""
-    fi
+    SEARXNG_CFG_DIR="$HOME/.config/searxng-ai"
+    SEARXNG_QUADLET="$QUADLET_DIR/searxng-ai.container"
 
-    # ─── 6.7 LiteLLM ───────────────────────────────────────────────────────
-    echo -e "\n${C_CYAN}[ INFO ]${RESET} Setting up LiteLLM router..."
+    mkdir -p "$SEARXNG_CFG_DIR"
 
-    LITELLM_VENV="$HOME/.local/share/litellm-venv"
-    LITELLM_CONFIG="$HOME/.config/litellm/config.yaml"
-    LITELLM_SERVICE="$HOME/.config/systemd/user/litellm.service"
-
-    # LiteLLM proxy (uvloop/fastuuid/orjson) doesn't build cleanly on Python 3.13+.
-    # Pick the highest available Python <= 3.12 for the venv.
-    LITELLM_PY=""
-    for cand in python3.12 python3.11 python3.10; do
-        if command -v "$cand" &>/dev/null; then
-            LITELLM_PY="$cand"
-            break
-        fi
-    done
-    if [ -z "$LITELLM_PY" ]; then
-        printf "  -> No Python 3.12/3.11/3.10 found %-15s ${C_RED}[FAIL]${RESET}\n" ""
-        printf "  -> Install with: ${BOLD}paru -S python312${RESET}\n"
-        FAILED_PKGS+=("litellm[proxy]")
-    else
-        printf "  -> Using interpreter: %-25s ${C_GREEN}[ OK ]${RESET}\n" "$LITELLM_PY"
-
-        if [ ! -d "$LITELLM_VENV" ]; then
-            "$LITELLM_PY" -m venv "$LITELLM_VENV"
-        else
-            # If existing venv was built with a now-removed Python (e.g. 3.13 → 3.12 switch),
-            # the symlinks break. Recreate if the embedded python is gone.
-            if ! "$LITELLM_VENV/bin/python" --version &>/dev/null; then
-                printf "  -> Existing venv broken — recreating %-9s ${C_YELLOW}[WARN]${RESET}\n" ""
-                rm -rf "$LITELLM_VENV"
-                "$LITELLM_PY" -m venv "$LITELLM_VENV"
-            fi
-        fi
-        "$LITELLM_VENV/bin/pip" install --upgrade pip --quiet 2>&1 | tail -1 || true
-
-        if "$LITELLM_VENV/bin/pip" install --quiet "litellm[proxy]"; then
-            printf "  -> LiteLLM installed %-26s ${C_GREEN}[ OK ]${RESET}\n" ""
-        else
-            printf "  -> LiteLLM install failed %-21s ${C_RED}[FAIL]${RESET}\n" ""
-            FAILED_PKGS+=("litellm[proxy]")
-        fi
-    fi
-
-    mkdir -p "$(dirname "$LITELLM_CONFIG")"
-    if [ -f "$LITELLM_CONFIG" ]; then
-        chmod 600 "$LITELLM_CONFIG"
-        LITELLM_KEY=$(grep "^  master_key:" "$LITELLM_CONFIG" | awk '{print $2}')
-        printf "  -> LiteLLM config exists (key preserved) %-7s ${C_GREEN}[ OK ]${RESET}\n" ""
-    else
-        LITELLM_KEY="sk-$(openssl rand -hex 24)"
-        cat > "$LITELLM_CONFIG" <<YAML
-# LiteLLM router. Edit and run: systemctl --user restart litellm
-model_list:
-  - model_name: local
-    litellm_params:
-      model: ollama/qwen2.5:7b
-      api_base: http://localhost:11434
-
-  - model_name: vision
-    litellm_params:
-      model: ollama/qwen2.5-vl:7b
-      api_base: http://localhost:11434
-
-  # Uncomment + add your Ollama Cloud key:
-  # - model_name: deep-think
-  #   litellm_params:
-  #     model: openai/qwen3.5:cloud
-  #     api_base: https://ollama.com/v1
-  #     api_key: os.environ/OLLAMA_CLOUD_API_KEY
-
-general_settings:
-  master_key: $LITELLM_KEY
-  database_url: "sqlite:///$HOME/.local/share/litellm.db"
-
-litellm_settings:
-  drop_params: true
-  json_logs: true
-  request_timeout: 600
-  num_retries: 2
-YAML
-        chmod 600 "$LITELLM_CONFIG"
-        printf "  -> LiteLLM config written (mode 600) %-11s ${C_GREEN}[ OK ]${RESET}\n" ""
-    fi
-
-    mkdir -p "$(dirname "$LITELLM_SERVICE")"
-    cat > "$LITELLM_SERVICE" <<EOF
-[Unit]
-Description=LiteLLM router
-After=network-online.target
-
-[Service]
-Type=simple
-ExecStart=$LITELLM_VENV/bin/litellm --config $LITELLM_CONFIG --port 4000 --host 127.0.0.1
-Restart=on-failure
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=default.target
-EOF
-    chmod 644 "$LITELLM_SERVICE"
-    systemctl --user daemon-reload
-
-    if systemctl --user enable --now litellm.service 2>/dev/null; then
-        printf "  -> litellm.service enabled %-20s ${C_GREEN}[ OK ]${RESET}\n" ""
-    else
-        printf "  -> litellm.service failed %-21s ${C_YELLOW}[WARN]${RESET}\n" ""
-    fi
-
-    if ! loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
-        sudo loginctl enable-linger "$USER" 2>/dev/null && \
-            printf "  -> User lingering enabled %-21s ${C_GREEN}[ OK ]${RESET}\n" "" || true
-    fi
-
-    for i in $(seq 1 15); do
-        if curl -fsS -m 2 "http://localhost:4000/health/readiness" \
-            -H "Authorization: Bearer $LITELLM_KEY" &>/dev/null; then
-            printf "  -> LiteLLM health check %-23s ${C_GREEN}[ OK ]${RESET}\n" ""
-            break
-        fi
-        sleep 1
-    done
-
-    # ─── 6.8 Hermes Agent ──────────────────────────────────────────────────
-    #
-    # Hermes Agent (NousResearch) install rewritten for current upstream:
-    #
-    #   - Uses the official installer with --skip-setup (we provide our own config).
-    #   - No more Playwright/Chromium download — current Hermes only does
-    #     `npm install` for browser tools, and only USES them when invoked.
-    #     Nothing to patch out. The old sed patch and `HERMES_SKIP_BROWSER` env
-    #     vars are gone.
-    #   - Config layout matches current upstream:
-    #       ~/.hermes/config.yaml   (inference + provider config)
-    #       ~/.hermes/.env          (LITELLM_API_KEY for the custom provider)
-    #       ~/.hermes/SOUL.md       (persona — leave installer to create)
-    #   - LiteLLM is registered as a custom_provider; Hermes accepts any
-    #     OpenAI-compatible endpoint via that mechanism.
-    #   - autobrowse MCP server is added via `hermes mcp add` AFTER install,
-    #     not by hand-writing YAML, because Hermes's MCP schema is internal.
-    #
-    # If the user has no internet or doesn't consent, we skip cleanly.
-    # ────────────────────────────────────────────────────────────────────────
-    echo -e "\n${C_CYAN}[ INFO ]${RESET} Setting up Hermes Agent..."
-
-    echo -e "\n${C_CYAN}[ INFO ]${RESET} Setting up Hermes Agent..."
-
-    HERMES_HOME="$HOME/.hermes"
-    HERMES_CFG="$HERMES_HOME/config.yaml"
-    HERMES_ENV="$HERMES_HOME/.env"
-    HERMES_INSTALL_URL="https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh"
-
-    if command -v hermes &>/dev/null; then
-        printf "  -> hermes already installed %-19s ${C_GREEN}[ OK ]${RESET}\n" ""
-    elif [ "$HEADLESS" = "true" ]; then
-        printf "  -> Hermes (skipped in headless mode) %-10s ${C_BLUE}[SKIP]${RESET}\n" ""
-    else
-        echo -e "  -> ${C_YELLOW}Hermes is third-party (NousResearch).${RESET}"
-        echo -e "  -> ${DIM}Installer: $HERMES_INSTALL_URL${RESET}"
-        echo -e "  -> ${DIM}Will run with --skip-setup; we provide config separately.${RESET}"
-        read -rp "  Install Hermes Agent now? [y/N] " yn
-        if [[ "$yn" =~ ^[Yy]$ ]]; then
-            tmp_inst=$(mktemp --suffix=.sh)
-            if curl -fsSL "$HERMES_INSTALL_URL" -o "$tmp_inst"; then
-                echo -e "  -> Saved installer to $tmp_inst"
-                echo -e "  -> SHA-256: $(sha256sum "$tmp_inst" | awk '{print $1}')"
-                echo -e "  -> ${DIM}Review with: less $tmp_inst${RESET}"
-                read -rp "  Proceed with installation? [y/N] " yn2
-                if [[ "$yn2" =~ ^[Yy]$ ]]; then
-                    # --skip-setup avoids the interactive provider wizard at end
-                    # of install — we write our own config.yaml below.
-                    if sudo bash "$tmp_inst" --skip-setup; then
-                        printf "  -> Hermes installed %-27s ${C_GREEN}[ OK ]${RESET}\n" ""
-                    else
-                        printf "  -> Hermes installer non-zero exit %-13s ${C_YELLOW}[WARN]${RESET}\n" ""
-                    fi
-                else
-                    echo "  -> Skipped (you can run later: sudo bash $tmp_inst --skip-setup)"
-                fi
-            else
-                printf "  -> Could not fetch installer %-21s ${C_YELLOW}[WARN]${RESET}\n" ""
-            fi
-            rm -f "$tmp_inst"
-        else
-            echo "  -> Skipped Hermes install"
-        fi
-    fi
-
-    # ─── Hermes configuration ───────────────────────────────────────────────
-    # Always (re)write ~/.hermes/.env and ~/.hermes/config.yaml when Hermes is
-    # installed, even if the install was skipped above — the user may have
-    # installed Hermes themselves and just wants our wiring.
-
-    if command -v hermes &>/dev/null; then
-        mkdir -p "$HERMES_HOME"
-        chmod 700 "$HERMES_HOME"
-
-        # ── .env: API keys live here, kept out of YAML for security ──
-        # Hermes loads ~/.hermes/.env automatically at startup. We point at
-        # LiteLLM as the unified gateway; LiteLLM does its own routing to
-        # Ollama / cloud providers based on the model name.
-        if [ ! -f "$HERMES_ENV" ]; then
-            cat > "$HERMES_ENV" <<ENVEOF
-# Hermes environment — auto-generated by install.sh.
-# Keep API keys here, NOT in config.yaml.
-
-# LiteLLM gateway — running on this host at port 4000.
-# Hermes treats this as a "custom" OpenAI-compatible provider.
-LITELLM_API_KEY=${LITELLM_KEY:-changeme}
-LITELLM_BASE_URL=http://localhost:4000
-
-# Optional cloud fallbacks. Leave commented unless you actually have keys.
-# OPENROUTER_API_KEY=
-# ANTHROPIC_API_KEY=
-# OPENAI_API_KEY=
-ENVEOF
-            chmod 600 "$HERMES_ENV"
-            printf "  -> Wrote ~/.hermes/.env (mode 600) %-12s ${C_GREEN}[ OK ]${RESET}\n" ""
-        else
-            printf "  -> ~/.hermes/.env already exists, keeping it %-1s ${C_BLUE}[KEEP]${RESET}\n" ""
-        fi
-
-        # ── config.yaml: Hermes's main config ──
-        # Schema reference: cli-config.yaml.example in the Hermes repo.
-        # We register LiteLLM as a named custom provider, then point
-        # `inference` at it. If LiteLLM isn't running, Hermes will error at
-        # runtime with a clear message — the YAML itself is always valid.
-        if [ ! -f "$HERMES_CFG" ]; then
-            # Pick a primary model name. If user has a local LiteLLM route
-            # named "local" (our default), use that; otherwise default to a
-            # raw Ollama model name and let LiteLLM pass-through route it.
-            H_MODEL="local"
-            [ -z "$LITELLM_KEY" ] && H_MODEL="qwen2.5:7b"
-
-            cat > "$HERMES_CFG" <<YAMLEOF
-# Hermes Agent configuration — auto-generated by install.sh.
-# This file is YAML. Keep API keys in ~/.hermes/.env, NOT here.
-# To regenerate: delete this file and re-run install.sh.
-
-# ── Inference ────────────────────────────────────────────────────────────
-# Use our LiteLLM gateway as a named custom provider.
-inference:
-  provider: litellm-local
-  model: ${H_MODEL}
-
-# ── Custom providers ─────────────────────────────────────────────────────
-# LiteLLM exposes an OpenAI-compatible API at :4000.
-# api_key resolves from the LITELLM_API_KEY env var (set in ~/.hermes/.env).
-custom_providers:
-  - name: litellm-local
-    base_url: http://localhost:4000
-    api_key_env: LITELLM_API_KEY
-    # Tag this provider so Hermes knows it speaks OpenAI's chat format.
-    api_format: openai
-
-# ── Terminal tool ────────────────────────────────────────────────────────
-# Hermes can run shell commands. Default to ASK approval before every run.
-# Edit allowlist/denylist as desired; these are starting points only.
-terminal:
-  backend: local
-  approval: ask
-  allowlist:
-    - ls
-    - cat
-    - pwd
-    - echo
-    - hyprctl monitors
-    - hyprctl clients
-  denylist:
-    - rm -rf
-    - sudo
-    - dd
-    - mkfs
-    - passwd
-    - chmod 777
-    - chown root
-    - ":(){"
-
-# ── Display ──────────────────────────────────────────────────────────────
-display:
-  tool_progress: new
+    # Always (re)write settings.yml — it's the source-of-truth, hand-tuned.
+    # Note the literal ${SEARXNG_AI_SECRET} is left in the YAML; SearXNG
+    # expands env vars in its config at startup, and we pass the secret in
+    # via the quadlet's Environment= directive.
+    cat > "$SEARXNG_CFG_DIR/settings.yml" <<'YAMLEOF'
+# SearXNG settings for the AI-facing instance.
+# - JSON output only (LiteLLM/Hermes parse this)
+# - Rate limiter disabled (your VPN handles IP rotation/anonymity)
+# - Only engines we actually want the AI to query
+use_default_settings: true
+general:
+    debug: false
+    instance_name: "searxng-ai"
+    privacypolicy_url: false
+    donation_url: false
+    contact_url: false
+server:
+    secret_key: "${SEARXNG_AI_SECRET}"
+    base_url: http://searxng-ai:8080/
+    image_proxy: false
+    method: "POST"
+    public_instance: false
+    limiter: false           # disabled — VPN handles privacy/IP
+    default_http_headers:
+        X-Content-Type-Options: nosniff
+        X-Robots-Tag: noindex, nofollow
+ui:
+    static_use_hash: true
+    default_theme: simple
+    infinite_scroll: false
+search:
+    safe_search: 0
+    autocomplete: ""
+    formats:
+        - json              # only json, no html
+outgoing:
+    request_timeout: 15.0
+    max_request_timeout: 30.0
+    pool_connections: 50
+    pool_maxsize: 25
+    enable_http2: false      # VPN may or may not support h2 well — keep off
+    # The actual VPN SOCKS proxy is set via env vars in the quadlet
+engines:
+    # Search engines well-suited for LLM consumption.
+    # Add/remove as needed — bias toward text-heavy, low-cruft results.
+    - name: duckduckgo
+      disabled: false
+      timeout: 10.0
+    - name: brave
+      disabled: false
+      timeout: 10.0
+    - name: wikipedia
+      disabled: false
+    - name: wikidata
+      disabled: false
+    - name: github
+      disabled: false
+    - name: stackoverflow
+      disabled: false
+    - name: arxiv
+      disabled: false
+    - name: docker hub
+      disabled: false
+      shortcut: dh
+    # Disabled by default in this profile:
+    - name: google
+      disabled: true         # uncomment if VPN exit isn't blocked
+    - name: bing
+      disabled: true         # same
+doi_resolvers:
+    'oadoi.org': 'https://oadoi.org/'
+    'doi.org': 'https://doi.org/'
+default_doi_resolver: 'oadoi.org'
 YAMLEOF
-            chmod 600 "$HERMES_CFG"
-            printf "  -> Wrote ~/.hermes/config.yaml (mode 600) %-3s ${C_GREEN}[ OK ]${RESET}\n" ""
-        else
-            printf "  -> ~/.hermes/config.yaml already exists %-7s ${C_BLUE}[KEEP]${RESET}\n" ""
-        fi
+    chmod 600 "$SEARXNG_CFG_DIR/settings.yml"
+    printf "  -> Wrote settings.yml (mode 600) %-13s ${C_GREEN}[ OK ]${RESET}\n" ""
 
-        # ── MCP server registration: autobrowse ──
-        # Configure via the `hermes mcp` CLI rather than hand-editing YAML.
-        # The MCP schema is owned by Hermes and changes; the CLI is stable.
-        # We register only if autobrowse appears to be running locally.
-        if [ -n "${AUTOBROWSE_AUTH_TOKEN:-}" ] && command -v hermes &>/dev/null; then
-            # Use `hermes mcp list` to detect prior registration. Hermes
-            # returns non-zero if mcp isn't configured at all — in that case
-            # we just try the add. Either way, errors are non-fatal.
-            if ! hermes mcp list 2>/dev/null | grep -qE '\bautobrowse\b'; then
-                if hermes mcp add autobrowse \
-                        --transport http \
-                        --url "http://localhost:8080/mcp/" \
-                        --header "Authorization: Bearer ${AUTOBROWSE_AUTH_TOKEN}" \
-                        2>/dev/null; then
-                    printf "  -> Registered MCP server: autobrowse %-9s ${C_GREEN}[ OK ]${RESET}\n" ""
-                else
-                    printf "  -> MCP autobrowse register failed %-13s ${C_YELLOW}[WARN]${RESET}\n" ""
-                    echo "  -> Add manually later:"
-                    echo "       hermes mcp add autobrowse --transport http \\"
-                    echo "         --url http://localhost:8080/mcp/ \\"
-                    echo "         --header 'Authorization: Bearer <token>'"
-                fi
-            else
-                printf "  -> MCP autobrowse already registered %-10s ${C_BLUE}[KEEP]${RESET}\n" ""
-            fi
-        fi
-
-        # ── Convenience: ensure ~/.local/bin is on PATH for this shell ──
-        # The installer adds it to .bashrc/.zshrc, but our current shell
-        # session won't pick that up. Tell the user.
-        if ! echo "$PATH" | tr ':' '\n' | grep -qx "$HOME/.local/bin"; then
-            echo -e "  -> ${DIM}Note: ~/.local/bin not on PATH in this shell.${RESET}"
-            echo -e "  -> ${DIM}Restart your terminal or run: source ~/.zshrc${RESET}"
-        fi
-    fi
-
-    # ─── 6.85 Kavita (reading server, runs in podman locally) ─────────────
-    echo -e "\n${C_CYAN}[ INFO ]${RESET} Setting up Kavita reading server..."
-
-    KAVITA_QUADLET_DIR="$HOME/.config/containers/systemd"
-    KAVITA_QUADLET="$KAVITA_QUADLET_DIR/kavita.container"
-    KAVITA_LIBRARY="$HOME/Books"
-
-    mkdir -p "$KAVITA_QUADLET_DIR" "$KAVITA_LIBRARY"
-
-    # Pull the image up front so the first start isn't slow + fails quietly
+    # Pull image up front so first start is fast
     if command -v podman &>/dev/null; then
-        echo "  -> Pulling Kavita image (jvmilazz0/kavita:latest)..."
-        if podman pull docker.io/jvmilazz0/kavita:latest 2>&1 | tail -3; then
-            printf "  -> Kavita image pulled %-25s ${C_GREEN}[ OK ]${RESET}\n" ""
+        echo "  -> Pulling SearXNG image (searxng/searxng:latest)..."
+        if podman pull docker.io/searxng/searxng:latest 2>&1 | tail -3; then
+            printf "  -> SearXNG image pulled %-25s ${C_GREEN}[ OK ]${RESET}\n" ""
         else
-            printf "  -> Kavita image pull failed %-20s ${C_YELLOW}[WARN]${RESET}\n" ""
+            printf "  -> SearXNG image pull failed %-20s ${C_YELLOW}[WARN]${RESET}\n" ""
         fi
-    else
-        printf "  -> podman not installed %-23s ${C_YELLOW}[WARN]${RESET}\n" ""
     fi
 
-    # Write the quadlet — systemd-podman will compile it to a service unit
-    cat > "$KAVITA_QUADLET" <<EOF
+    cat > "$SEARXNG_QUADLET" <<EOF
 [Unit]
-Description=Kavita reading server
+Description=SearXNG private metasearch (AI-facing instance)
 After=network-online.target
 
 [Container]
-Image=docker.io/jvmilazz0/kavita:latest
-ContainerName=kavita
-PublishPort=127.0.0.1:5000:5000
-Environment=TZ=$(cat /etc/timezone 2>/dev/null || echo "America/Los_Angeles")
-Volume=kavita-config:/kavita/config
-Volume=$KAVITA_LIBRARY:/library:Z
+Image=docker.io/searxng/searxng:latest
+ContainerName=searxng-ai
+PublishPort=127.0.0.1:8888:8080
+Environment=SEARXNG_AI_SECRET=$SEARXNG_AI_SECRET
+Environment=SEARXNG_BASE_URL=http://localhost:8888/
+# To route SearXNG outbound traffic through a VPN SOCKS proxy, uncomment and set:
+#Environment=HTTP_PROXY=socks5h://vpn-host:1080
+#Environment=HTTPS_PROXY=socks5h://vpn-host:1080
+Volume=$SEARXNG_CFG_DIR/settings.yml:/etc/searxng/settings.yml:Z,ro
 AutoUpdate=registry
 
 [Service]
@@ -1717,38 +1502,44 @@ TimeoutStartSec=120
 [Install]
 WantedBy=default.target
 EOF
-    chmod 644 "$KAVITA_QUADLET"
-    printf "  -> Kavita quadlet written %-21s ${C_GREEN}[ OK ]${RESET}\n" ""
+    chmod 644 "$SEARXNG_QUADLET"
+    printf "  -> SearXNG quadlet written %-20s ${C_GREEN}[ OK ]${RESET}\n" ""
 
-    # Reload + enable
     systemctl --user daemon-reload
-    if systemctl --user enable --now kavita.service 2>/dev/null; then
-        printf "  -> kavita.service enabled %-21s ${C_GREEN}[ OK ]${RESET}\n" ""
+    if systemctl --user enable --now searxng-ai.service 2>/dev/null; then
+        printf "  -> searxng-ai.service enabled %-17s ${C_GREEN}[ OK ]${RESET}\n" ""
     else
-        printf "  -> kavita.service failed %-22s ${C_YELLOW}[WARN]${RESET}\n" ""
-        printf "  -> ${DIM}Check: journalctl --user -xeu kavita${RESET}\n"
+        printf "  -> searxng-ai.service failed %-18s ${C_YELLOW}[WARN]${RESET}\n" ""
+        printf "  -> ${DIM}Check: journalctl --user -xeu searxng-ai${RESET}\n"
     fi
 
-    # Wait briefly for Kavita to come up — first-time DB init can take 30s+
-    echo "  -> Waiting for Kavita web UI..."
-    for i in $(seq 1 20); do
-        if curl -fsS -m 1 http://localhost:5000 >/dev/null 2>&1; then
-            printf "  -> Kavita responding at localhost:5000 %-7s ${C_GREEN}[ OK ]${RESET}\n" ""
+    # Wait for it to come up
+    echo "  -> Waiting for SearXNG..."
+    for i in $(seq 1 25); do
+        if curl -fsS -m 1 "http://localhost:8888/" >/dev/null 2>&1; then
+            printf "  -> SearXNG responding at :8888 %-15s ${C_GREEN}[ OK ]${RESET}\n" ""
             break
         fi
         sleep 1
-        [ "$i" -eq 20 ] && printf "  -> Kavita slow to start (still pending) %-6s ${C_YELLOW}[WARN]${RESET}\n" ""
+        [ "$i" -eq 25 ] && printf "  -> SearXNG slow to start %-22s ${C_YELLOW}[WARN]${RESET}\n" ""
     done
 
-    echo "  -> ${C_CYAN}First-time setup:${RESET} Open ${BOLD}http://localhost:5000${RESET}"
-    echo "  -> ${C_CYAN}Library path:${RESET} $KAVITA_LIBRARY (drop books here, mounted as /library inside)"
-    echo "  -> ${C_CYAN}Get API key:${RESET} Account → API Key → paste into ai_config.json"
+    echo "  -> ${C_CYAN}Web UI:${RESET}      http://localhost:8888/"
+    echo "  -> ${C_CYAN}JSON query:${RESET}  http://localhost:8888/search?q=hello&format=json"
+    echo "  -> ${C_CYAN}Config:${RESET}      $SEARXNG_CFG_DIR/settings.yml"
+fi
 
-    # ─── 6.87 stealthy-auto-browse (replaces Hermes built-in Chromium browser) ──
+# ==============================================================================
+# stealthy-auto-browse (browser backend for Hermes / AI tooling)
+#
+# Camoufox-based stealth browser exposed as an MCP server on :8080 and a
+# live noVNC viewer on :5900. Bound to 127.0.0.1 only. Authentication via
+# AUTH_TOKEN (generated above in the PRE-AI block).
+# ==============================================================================
+if [ "$OPT_AI" = true ]; then
     echo -e "\n${C_CYAN}[ INFO ]${RESET} Setting up stealthy-auto-browse (browser backend for Hermes)..."
 
-    AUTOBROWSE_QUADLET="$HOME/.config/containers/systemd/autobrowse.container"
-    # AUTOBROWSE_AUTH_TOKEN was generated earlier in the OPT_AI block
+    AUTOBROWSE_QUADLET="$QUADLET_DIR/autobrowse.container"
 
     if command -v podman &>/dev/null; then
         echo "  -> Pulling stealthy-auto-browse image (psyb0t/stealthy-auto-browse:latest)..."
@@ -1810,22 +1601,327 @@ EOF
     echo "  -> ${C_CYAN}MCP endpoint:${RESET} http://localhost:8080/mcp/"
     echo "  -> ${C_CYAN}Live VNC:${RESET}    http://localhost:5900/  (watch the browser in real time)"
     echo "  -> ${C_CYAN}Auth token:${RESET}  saved to version state file (for Hermes wiring)"
+fi
+
+# ==============================================================================
+# AI STACK: Ollama → Hermes → Kavita
+# LiteLLM was removed. Hermes now talks to Ollama directly via its native API,
+# which Hermes treats as an OpenAI-compatible custom provider at /v1.
+# ==============================================================================
+
+if [ "$OPT_AI" = true ]; then
+    # ─── 6.6 Ollama ────────────────────────────────────────────────────────
+    # The correct variant (ollama / ollama-cuda / ollama-rocm) was already
+    # appended to PKGS earlier in this script and installed by the main
+    # package loop. This block just enables the service and waits for it.
+    echo -e "\n${C_CYAN}[ INFO ]${RESET} Setting up Ollama (local model server, variant: ${BOLD}$OLLAMA_PKG${RESET})..."
+
+    if command -v ollama &>/dev/null; then
+        # Lock Ollama to localhost (default binds 0.0.0.0:11434).
+        # Override via systemd drop-in so package updates don't clobber it.
+        sudo mkdir -p /etc/systemd/system/ollama.service.d
+        sudo tee /etc/systemd/system/ollama.service.d/override.conf >/dev/null <<'OLLAMAEOF'
+[Service]
+Environment=OLLAMA_HOST=127.0.0.1:11434
+OLLAMAEOF
+        sudo systemctl daemon-reload
+
+        if sudo systemctl enable --now ollama 2>/dev/null; then
+            printf "  -> ollama.service running (localhost only) %-4s ${C_GREEN}[ OK ]${RESET}\n" ""
+        else
+            printf "  -> ollama.service failed %-22s ${C_YELLOW}[WARN]${RESET}\n" ""
+        fi
+
+        for i in $(seq 1 10); do
+            if curl -fsS -m 1 http://localhost:11434/api/tags &>/dev/null; then
+                printf "  -> Ollama responding %-26s ${C_GREEN}[ OK ]${RESET}\n" ""
+                break
+            fi
+            sleep 1
+        done
+
+        # GPU-specific guidance
+        case "$GPU_VENDOR" in
+            NVIDIA) echo -e "  -> ${C_GREEN}NVIDIA CUDA build active.${RESET} ${BOLD}nvidia-smi${RESET} to verify GPU is visible." ;;
+            AMD)    echo -e "  -> ${C_GREEN}AMD ROCm build active.${RESET} Check ${BOLD}rocminfo${RESET} (may need rocm-smi-lib)." ;;
+            INTEL)  echo -e "  -> ${C_YELLOW}Intel GPU: using CPU-only Ollama build.${RESET}"
+                    echo -e "     ${DIM}For Intel ARC/Iris XE acceleration, see ipex-llm — not packaged for Arch yet.${RESET}" ;;
+            *)      echo -e "  -> ${C_YELLOW}CPU-only Ollama build (VM / unknown GPU).${RESET}" ;;
+        esac
+
+        echo -e "  -> ${C_CYAN}Pull a model with:${RESET} ${BOLD}ollama pull qwen2.5:7b${RESET}"
+    else
+        printf "  -> ollama not installed (variant: $OLLAMA_PKG) %-3s ${C_YELLOW}[WARN]${RESET}\n" ""
+        echo -e "  -> ${C_YELLOW}Install it manually:${RESET} ${BOLD}$PKG_MANAGER $OLLAMA_PKG${RESET}"
+    fi
+
+    # ─── 6.8 Hermes Agent ──────────────────────────────────────────────────
+    #
+    # Hermes is wired directly to Ollama. Hermes treats Ollama's OpenAI-
+    # compatible endpoint (/v1) as a "custom" provider — same shape as
+    # OpenAI's API, no API key needed (Ollama ignores Authorization headers
+    # but Hermes requires an env var, so we set a dummy).
+    # ────────────────────────────────────────────────────────────────────────
+    echo -e "\n${C_CYAN}[ INFO ]${RESET} Setting up Hermes Agent..."
+
+    HERMES_HOME="$HOME/.hermes"
+    HERMES_CFG="$HERMES_HOME/config.yaml"
+    HERMES_ENV="$HERMES_HOME/.env"
+    HERMES_INSTALL_URL="https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh"
+
+    if command -v hermes &>/dev/null; then
+        printf "  -> hermes already installed %-19s ${C_GREEN}[ OK ]${RESET}\n" ""
+    elif [ "$HEADLESS" = "true" ]; then
+        printf "  -> Hermes (skipped in headless mode) %-10s ${C_BLUE}[SKIP]${RESET}\n" ""
+    else
+        echo -e "  -> ${C_YELLOW}Hermes is third-party (NousResearch).${RESET}"
+        echo -e "  -> ${DIM}Installer: $HERMES_INSTALL_URL${RESET}"
+        echo -e "  -> ${DIM}Will run with --skip-setup; we provide config separately.${RESET}"
+        read -rp "  Install Hermes Agent now? [y/N] " yn
+        if [[ "$yn" =~ ^[Yy]$ ]]; then
+            tmp_inst=$(mktemp --suffix=.sh)
+            if curl -fsSL "$HERMES_INSTALL_URL" -o "$tmp_inst"; then
+                echo -e "  -> Saved installer to $tmp_inst"
+                echo -e "  -> SHA-256: $(sha256sum "$tmp_inst" | awk '{print $1}')"
+                echo -e "  -> ${DIM}Review with: less $tmp_inst${RESET}"
+                read -rp "  Proceed with installation? [y/N] " yn2
+                if [[ "$yn2" =~ ^[Yy]$ ]]; then
+                    # --skip-setup avoids the interactive provider wizard at end
+                    # of install — we write our own config.yaml below.
+                    if sudo bash "$tmp_inst" --skip-setup; then
+                        printf "  -> Hermes installed %-27s ${C_GREEN}[ OK ]${RESET}\n" ""
+                    else
+                        printf "  -> Hermes installer non-zero exit %-13s ${C_YELLOW}[WARN]${RESET}\n" ""
+                    fi
+                else
+                    echo "  -> Skipped (you can run later: sudo bash $tmp_inst --skip-setup)"
+                fi
+            else
+                printf "  -> Could not fetch installer %-21s ${C_YELLOW}[WARN]${RESET}\n" ""
+            fi
+            rm -f "$tmp_inst"
+        else
+            echo "  -> Skipped Hermes install"
+        fi
+    fi
+
+    # ─── Hermes configuration ───────────────────────────────────────────────
+    if command -v hermes &>/dev/null; then
+        mkdir -p "$HERMES_HOME"
+        chmod 700 "$HERMES_HOME"
+
+        # ── .env ──
+        # Ollama doesn't need a real key, but Hermes requires its custom
+        # provider to reference an env var. We set a dummy "ollama" string.
+        if [ ! -f "$HERMES_ENV" ]; then
+            cat > "$HERMES_ENV" <<ENVEOF
+# Hermes environment — auto-generated by install.sh.
+# Keep real API keys here, NOT in config.yaml.
+
+# Ollama doesn't authenticate, but Hermes wants an env var.
+# Any non-empty value works.
+OLLAMA_API_KEY=ollama
+OLLAMA_BASE_URL=http://localhost:11434/v1
+
+# autobrowse MCP token (used by the MCP registration below).
+AUTOBROWSE_AUTH_TOKEN=$AUTOBROWSE_AUTH_TOKEN
+
+# SearXNG for tool-call web search (no auth, but here for reference).
+SEARXNG_URL=http://localhost:8888
+
+# Optional cloud fallbacks. Leave commented unless you actually have keys.
+# OPENROUTER_API_KEY=
+# ANTHROPIC_API_KEY=
+# OPENAI_API_KEY=
+ENVEOF
+            chmod 600 "$HERMES_ENV"
+            printf "  -> Wrote ~/.hermes/.env (mode 600) %-12s ${C_GREEN}[ OK ]${RESET}\n" ""
+        else
+            printf "  -> ~/.hermes/.env already exists, keeping it %-1s ${C_BLUE}[KEEP]${RESET}\n" ""
+        fi
+
+        # ── config.yaml ──
+        # Inference points at our local Ollama via the OpenAI-compatible /v1
+        # endpoint. Change `model:` to whatever you `ollama pull`'d.
+        if [ ! -f "$HERMES_CFG" ]; then
+            cat > "$HERMES_CFG" <<YAMLEOF
+# Hermes Agent configuration — auto-generated by install.sh.
+# This file is YAML. Keep API keys in ~/.hermes/.env, NOT here.
+# To regenerate: delete this file and re-run install.sh.
+
+# ── Inference ────────────────────────────────────────────────────────────
+# Talks directly to local Ollama via its OpenAI-compatible endpoint.
+# To use a different model, run \`ollama pull <name>\` and change \`model:\`.
+inference:
+  provider: ollama-local
+  model: qwen2.5:7b
+
+# ── Custom providers ─────────────────────────────────────────────────────
+# Ollama exposes an OpenAI-compatible API at :11434/v1.
+# api_key resolves from OLLAMA_API_KEY in ~/.hermes/.env (dummy value).
+custom_providers:
+  - name: ollama-local
+    base_url: http://localhost:11434/v1
+    api_key_env: OLLAMA_API_KEY
+    api_format: openai
+
+# ── Terminal tool ────────────────────────────────────────────────────────
+# Hermes can run shell commands. Default to ASK approval before every run.
+# Edit allowlist/denylist as desired; these are starting points only.
+terminal:
+  backend: local
+  approval: ask
+  allowlist:
+    - ls
+    - cat
+    - pwd
+    - echo
+    - hyprctl monitors
+    - hyprctl clients
+  denylist:
+    - rm -rf
+    - sudo
+    - dd
+    - mkfs
+    - passwd
+    - chmod 777
+    - chown root
+    - ":(){"
+
+# ── Display ──────────────────────────────────────────────────────────────
+display:
+  tool_progress: new
+YAMLEOF
+            chmod 600 "$HERMES_CFG"
+            printf "  -> Wrote ~/.hermes/config.yaml (mode 600) %-3s ${C_GREEN}[ OK ]${RESET}\n" ""
+        else
+            printf "  -> ~/.hermes/config.yaml already exists %-7s ${C_BLUE}[KEEP]${RESET}\n" ""
+        fi
+
+        # ── MCP server registration: autobrowse ──
+        if [ -n "${AUTOBROWSE_AUTH_TOKEN:-}" ] && command -v hermes &>/dev/null; then
+            if ! hermes mcp list 2>/dev/null | grep -qE '\bautobrowse\b'; then
+                if hermes mcp add autobrowse \
+                        --transport http \
+                        --url "http://localhost:8080/mcp/" \
+                        --header "Authorization: Bearer ${AUTOBROWSE_AUTH_TOKEN}" \
+                        2>/dev/null; then
+                    printf "  -> Registered MCP server: autobrowse %-9s ${C_GREEN}[ OK ]${RESET}\n" ""
+                else
+                    printf "  -> MCP autobrowse register failed %-13s ${C_YELLOW}[WARN]${RESET}\n" ""
+                    echo "  -> Add manually later:"
+                    echo "       hermes mcp add autobrowse --transport http \\"
+                    echo "         --url http://localhost:8080/mcp/ \\"
+                    echo "         --header 'Authorization: Bearer <token>'"
+                fi
+            else
+                printf "  -> MCP autobrowse already registered %-10s ${C_BLUE}[KEEP]${RESET}\n" ""
+            fi
+        fi
+
+        # ── Convenience: ensure ~/.local/bin is on PATH for this shell ──
+        if ! echo "$PATH" | tr ':' '\n' | grep -qx "$HOME/.local/bin"; then
+            echo -e "  -> ${DIM}Note: ~/.local/bin not on PATH in this shell.${RESET}"
+            echo -e "  -> ${DIM}Restart your terminal or run: source ~/.zshrc${RESET}"
+        fi
+    fi
+
+    # ─── 6.85 Kavita (reading server, runs in podman locally) ─────────────
+    echo -e "\n${C_CYAN}[ INFO ]${RESET} Setting up Kavita reading server..."
+
+    KAVITA_QUADLET="$QUADLET_DIR/kavita.container"
+    KAVITA_LIBRARY="$HOME/Books"
+
+    mkdir -p "$KAVITA_LIBRARY"
+
+    # Pull the image up front so the first start isn't slow + fails quietly
+    if command -v podman &>/dev/null; then
+        echo "  -> Pulling Kavita image (jvmilazz0/kavita:latest)..."
+        if podman pull docker.io/jvmilazz0/kavita:latest 2>&1 | tail -3; then
+            printf "  -> Kavita image pulled %-25s ${C_GREEN}[ OK ]${RESET}\n" ""
+        else
+            printf "  -> Kavita image pull failed %-20s ${C_YELLOW}[WARN]${RESET}\n" ""
+        fi
+    else
+        printf "  -> podman not installed %-23s ${C_YELLOW}[WARN]${RESET}\n" ""
+    fi
+
+    # Write the quadlet — systemd-podman will compile it to a service unit
+    cat > "$KAVITA_QUADLET" <<EOF
+[Unit]
+Description=Kavita reading server
+After=network-online.target
+
+[Container]
+Image=docker.io/jvmilazz0/kavita:latest
+ContainerName=kavita
+PublishPort=127.0.0.1:5000:5000
+Environment=TZ=$(cat /etc/timezone 2>/dev/null || echo "America/Los_Angeles")
+Volume=kavita-config:/kavita/config
+Volume=$KAVITA_LIBRARY:/library:Z
+AutoUpdate=registry
+
+[Service]
+Restart=always
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target
+EOF
+    chmod 644 "$KAVITA_QUADLET"
+    printf "  -> Kavita quadlet written %-21s ${C_GREEN}[ OK ]${RESET}\n" ""
+
+    # Reload + enable
+    systemctl --user daemon-reload
+    if systemctl --user enable --now kavita.service 2>/dev/null; then
+        printf "  -> kavita.service enabled %-21s ${C_GREEN}[ OK ]${RESET}\n" ""
+    else
+        printf "  -> kavita.service failed %-22s ${C_YELLOW}[WARN]${RESET}\n" ""
+        printf "  -> ${DIM}Check: journalctl --user -xeu kavita${RESET}\n"
+    fi
+
+    # User lingering — needed for user services to persist across login/logout
+    if ! loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
+        sudo loginctl enable-linger "$USER" 2>/dev/null && \
+            printf "  -> User lingering enabled %-21s ${C_GREEN}[ OK ]${RESET}\n" "" || true
+    fi
+
+    # Wait briefly for Kavita to come up — first-time DB init can take 30s+
+    echo "  -> Waiting for Kavita web UI..."
+    for i in $(seq 1 20); do
+        if curl -fsS -m 1 http://localhost:5000 >/dev/null 2>&1; then
+            printf "  -> Kavita responding at localhost:5000 %-7s ${C_GREEN}[ OK ]${RESET}\n" ""
+            break
+        fi
+        sleep 1
+        [ "$i" -eq 20 ] && printf "  -> Kavita slow to start (still pending) %-6s ${C_YELLOW}[WARN]${RESET}\n" ""
+    done
+
+    echo "  -> ${C_CYAN}First-time setup:${RESET} Open ${BOLD}http://localhost:5000${RESET}"
+    echo "  -> ${C_CYAN}Library path:${RESET} $KAVITA_LIBRARY (drop books here, mounted as /library inside)"
+    echo "  -> ${C_CYAN}Get API key:${RESET} Account → API Key → paste into ai_config.json"
 
     # ─── 6.9 AI popup config ───────────────────────────────────────────────
+    # Points the popup at Ollama directly (LiteLLM removed). Also exposes
+    # SearXNG and Kavita URLs so the popup widget can query them.
     AI_CFG="$HOME/.config/hypr/ai_config.json"
     if [ ! -f "$AI_CFG" ]; then
         mkdir -p "$(dirname "$AI_CFG")"
         cat > "$AI_CFG" <<JSON
 {
-    "api_key": "${LITELLM_KEY:-PASTE_LITELLM_KEY_HERE}",
-    "model": "local",
-    "base_url": "http://localhost:4000",
+    "api_key": "ollama",
+    "model": "qwen2.5:7b",
+    "base_url": "http://localhost:11434/v1",
+    "ollama_native_url": "http://localhost:11434",
+    "searxng_url": "http://localhost:8888",
     "lichess_token": "",
     "kavita_url": "http://localhost:5000",
     "kavita_api_key": "",
     "hermes_enabled": true,
     "hermes_endpoint": "http://localhost:5400/api/agent",
     "hermes_token": "",
+    "autobrowse_url": "http://localhost:8080",
+    "autobrowse_token": "$AUTOBROWSE_AUTH_TOKEN",
     "approval_policy": "ask"
 }
 JSON
@@ -2016,8 +2112,9 @@ KB_LAYOUTS="$KB_LAYOUTS"
 KB_LAYOUTS_DISPLAY="$KB_LAYOUTS_DISPLAY"
 KB_OPTIONS="$KB_OPTIONS"
 WALLPAPER_DIR="$WALLPAPER_DIR"
-LITELLM_KEY="$LITELLM_KEY"
+OLLAMA_PKG="$OLLAMA_PKG"
 AUTOBROWSE_AUTH_TOKEN="$AUTOBROWSE_AUTH_TOKEN"
+SEARXNG_AI_SECRET="$SEARXNG_AI_SECRET"
 EOF
 chmod 600 "$VERSION_FILE"
 
@@ -2086,10 +2183,13 @@ if [ ${#FAILED_PKGS[@]} -ne 0 ]; then
     echo ""
 fi
 
-if [ -n "$LITELLM_KEY" ]; then
-    echo -e "${BOLD}LiteLLM URL:${RESET} ${C_GREEN}http://localhost:4000${RESET}"
-    echo -e "${BOLD}LiteLLM key:${RESET} ${C_GREEN}$LITELLM_KEY${RESET}"
-    echo -e "${DIM}(also stored in $AI_CFG and $HERMES_CFG)${RESET}\n"
+if [ "$OPT_AI" = true ]; then
+    echo -e "${BOLD}AI Stack Summary:${RESET}"
+    echo -e "  ${BOLD}Ollama:${RESET}     ${C_GREEN}http://localhost:11434${RESET}  (variant: ${BOLD}$OLLAMA_PKG${RESET})"
+    echo -e "  ${BOLD}SearXNG:${RESET}    ${C_GREEN}http://localhost:8888${RESET}   (JSON: /search?q=...&format=json)"
+    echo -e "  ${BOLD}autobrowse:${RESET} ${C_GREEN}http://localhost:8080${RESET}   (live VNC at :5900)"
+    echo -e "  ${BOLD}Kavita:${RESET}     ${C_GREEN}http://localhost:5000${RESET}"
+    echo -e "${DIM}(secrets stored in $VERSION_FILE and $HOME/.config/hypr/ai_config.json)${RESET}\n"
 fi
 
 echo -e "Old configurations backed up to: ${C_CYAN}$BACKUP_DIR${RESET}"
@@ -2110,9 +2210,10 @@ if [ "$GPU_VENDOR" = "VM" ]; then
 fi
 
 echo -e "\nNext steps:"
-echo -e "  1. ${C_GREEN}ollama pull qwen2.5:7b${RESET}"
-echo -e "  2. Edit ${C_GREEN}$AI_CFG${RESET} (Lichess + Kavita keys)"
+echo -e "  1. ${C_GREEN}ollama pull qwen2.5:7b${RESET}  (or whichever model you want as the default)"
+echo -e "  2. Edit ${C_GREEN}$HOME/.config/hypr/ai_config.json${RESET} (Lichess + Kavita keys)"
 if command -v hermes &>/dev/null; then
-    echo -e "  3. Run ${C_GREEN}hermes${RESET} once to confirm config"
+    echo -e "  3. Run ${C_GREEN}hermes${RESET} once to confirm config (talks to Ollama directly)"
 fi
-echo -e "  4. ${C_GREEN}sudo reboot${RESET} for SDDM"
+echo -e "  4. Try SearXNG: ${C_GREEN}curl 'http://localhost:8888/search?q=test&format=json' | jq${RESET}"
+echo -e "  5. ${C_GREEN}sudo reboot${RESET} for SDDM"
