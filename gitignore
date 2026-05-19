@@ -1,0 +1,4 @@
+# Never commit the real .env — it has generated secrets
+.env
+# Template is fine to commit
+!.env.template
