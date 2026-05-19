@@ -1,29 +1,30 @@
 #!/usr/bin/env bash
-# ~/.config/hypr/scripts/quickshell/chess_stream.sh
+# chess_stream.sh — stream Lichess board game events to /tmp/qs_chess_event
+# Called by AiPopup.qml via Quickshell.execDetached.
 #
-# Streams Lichess game events to /tmp/qs_chess_event line by line.
-# Token is read from $LICHESS_TOKEN env var (not argv) so it doesn't
-# show up in `ps aux` to other processes on the machine.
+# Usage: LICHESS_TOKEN="lip_xxx" chess_stream.sh <gameId>
+# Each NDJSON event from the game stream is written to /tmp/qs_chess_event
+# (overwriting), which triggers the QML's inotifywait-based reader.
 
 set -u
-
-if [ -z "${LICHESS_TOKEN:-}" ]; then
-    echo "ERROR: LICHESS_TOKEN env var not set" >&2
-    exit 1
-fi
-
-GAME_ID="${1:-}"
-# Lichess game IDs are exactly 8 alphanumeric characters
-if ! [[ "$GAME_ID" =~ ^[a-zA-Z0-9]{8}$ ]]; then
-    echo "ERROR: invalid game ID: $GAME_ID" >&2
-    exit 1
-fi
-
+GAME_ID="${1:?Usage: chess_stream.sh <gameId>}"
+TOKEN="${LICHESS_TOKEN:?Set LICHESS_TOKEN}"
 EVENT_FILE="/tmp/qs_chess_event"
 
-curl -s --no-buffer \
-    -H "Authorization: Bearer $LICHESS_TOKEN" \
-    "https://lichess.org/api/board/game/stream/$GAME_ID" 2>/dev/null \
-| while IFS= read -r line; do
-    [ -n "$line" ] && printf '%s\n' "$line" > "$EVENT_FILE"
+# Clean up on exit
+cleanup() { rm -f "/tmp/chess_stream_${GAME_ID}.pid"; }
+trap cleanup EXIT
+echo $$ > "/tmp/chess_stream_${GAME_ID}.pid"
+
+# Stream game events — curl streams NDJSON, one JSON object per line.
+# We write each non-empty line to the event file so inotifywait picks it up.
+curl -sN \
+    -H "Authorization: Bearer ${TOKEN}" \
+    "https://lichess.org/api/board/game/stream/${GAME_ID}" \
+    2>/dev/null | while IFS= read -r line; do
+    # Skip empty keep-alive lines
+    [ -z "$line" ] && continue
+    # Atomic write: write to temp then mv to avoid partial reads
+    printf '%s' "$line" > "${EVENT_FILE}.tmp"
+    mv -f "${EVENT_FILE}.tmp" "$EVENT_FILE"
 done
