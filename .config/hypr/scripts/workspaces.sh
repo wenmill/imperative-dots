@@ -75,8 +75,13 @@ print_workspaces() {
             }
         )
     ' > "$QS_RUN_WORKSPACES/workspaces.tmp"
-    
+
+    # TopBar reads /tmp/qs_workspaces.json directly (and watches it with
+    # inotifywait). Publish there atomically. We keep the runtime-dir copy
+    # too for any other consumer that uses QS_RUN_WORKSPACES.
     mv "$QS_RUN_WORKSPACES/workspaces.tmp" "$QS_RUN_WORKSPACES/workspaces.json"
+    cp -f "$QS_RUN_WORKSPACES/workspaces.json" /tmp/qs_workspaces.json.tmp 2>/dev/null
+    mv -f /tmp/qs_workspaces.json.tmp /tmp/qs_workspaces.json 2>/dev/null
 }
 
 # Print initial state
