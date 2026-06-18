@@ -52,6 +52,20 @@ Item {
     // COLORS (Dynamic Matugen Palette)
     // -------------------------------------------------------------------------
     MatugenColors { id: _theme }
+    // Matugen palette loads async, overwriting defaults after open. Repaint the
+    // gauge canvases (and the temp-lens overlay) when the palette arrives so they
+    // come up in the right colors instead of flashing the defaults first.
+    Connections {
+        target: _theme
+        function onRawJsonChanged() {
+            if (typeof cpuCanvas !== "undefined") cpuCanvas.requestPaint();
+            if (typeof ramCanvas !== "undefined") ramCanvas.requestPaint();
+            if (typeof gpuCanvas !== "undefined") gpuCanvas.requestPaint();
+            if (typeof tempCanvas !== "undefined") tempCanvas.requestPaint();
+            if (typeof tempOverlay !== "undefined") tempOverlay.requestPaint();
+            if (typeof sideArcs !== "undefined") sideArcs.requestPaint();
+        }
+    }
     readonly property color base: _theme.base
     readonly property color mantle: _theme.mantle
     readonly property color crust: _theme.crust
@@ -84,7 +98,9 @@ Item {
         property int ramUsage: 0
         property int diskUsage: 0
         property int gpuUsage: 0
-        property int sysTemp: 0
+        property int gpuVram: 0
+        property int cpuTemp: 0
+        property int gpuTemp: 0
         property string powerProfile: "balanced"
         property int upHours: 0
         property int upMins: 0
@@ -100,8 +116,19 @@ Item {
     property int cpuUsage: widgetCache.cpuUsage
     property int ramUsage: widgetCache.ramUsage
     property int diskUsage: widgetCache.diskUsage
+    // ── Side-arc data ──────────────────────────────────────────────────────
+    // Percentages (0–100) drawn as split radial arcs flanking the gauges.
+    //   Left  : top = CPU fan, bottom = GPU fan  (speed as % of max RPM)
+    //   Right : top = system storage, bottom = NAS storage  (used %)
+    property int cpuFanPct: 0
+    property int gpuFanPct: 0
+    property int sysStoragePct: 0
+    property int nasStoragePct: 0
     property int gpuUsage: widgetCache.gpuUsage
-    property int sysTemp: widgetCache.sysTemp
+    property int gpuVram: widgetCache.gpuVram     // GPU VRAM usage %
+    property int cpuTemp: widgetCache.cpuTemp     // CPU temperature °C
+    property int gpuTemp: widgetCache.gpuTemp     // GPU temperature °C
+    property int uptimeSec: 0                      // live uptime in seconds (2-week gauge)
 
     property string powerProfile: widgetCache.powerProfile
     
@@ -184,19 +211,42 @@ Item {
         }
     }
 
+    // Network rate needs two samples; keep the previous byte counters + time.
+    property real _netPrevRx: -1
+    property real _netPrevTx: -1
+    property real _netPrevT: 0
+    property string netDownStr: "—"
+    property string netUpStr: "—"
     Process {
         id: sysPoller
-        // HIGHLY ROBUST BASH COMMANDS
-        command: ["bash", "-c", 
-            "vmstat 1 2 | tail -1 | awk '{print 100 - $15}' || echo '0'; " +
-            "free -m | awk '/Mem:/ {print int($3/$2 * 100)}' || echo '0'; " +
-            "df -h / | awk 'NR==2 {print $5}' | tr -d '%' || echo '0'; " +
-            "temp=$(sensors 2>/dev/null | grep -m 1 -E 'Package id 0|Tctl|Tdie|edge|temp1' | grep -oE '\\+[0-9]+\\.[0-9]+' | head -n 1 | tr -d '+' | cut -d. -f1); [ -z \"$temp\" ] && temp=$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | head -n 1 | awk '{print int($1/1000)}'); echo \"${temp:-0}\"; " +
-            "powerprofilesctl get 2>/dev/null || echo 'balanced'; " +
-            "awk '{print int($1/3600)\"h \"int(($1%3600)/60)\"m\"}' /proc/uptime 2>/dev/null || echo '0h 0m'; " +
-            "wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null | awk '{print int($2*100), ($3==\"[MUTED]\"?\"off\":\"on\")}' || echo '0 on'; " +
-            "brightnessctl -m 2>/dev/null | awk -F, '{print substr($4, 1, length($4)-1)}' || echo '0'; " +
-            "cat /sys/class/drm/card*/device/gpu_busy_percent 2>/dev/null | head -1 || { nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | grep -E '^[0-9]+$' || echo '0'; }"
+        // HIGHLY ROBUST BASH COMMANDS. Line order is parsed positionally below.
+        command: ["bash", "-c",
+            "vmstat 1 2 | tail -1 | awk '{print 100 - $15}' || echo '0'; " +                                   // 0 cpu%
+            "free -m | awk '/Mem:/ {print int($3/$2 * 100)}' || echo '0'; " +                                    // 1 ram%
+            "df -h / | awk 'NR==2 {print $5}' | tr -d '%' || echo '0'; " +                                       // 2 disk%
+            // 3 CPU temp (°C)
+            "ctemp=$(sensors 2>/dev/null | grep -m 1 -E 'Package id 0|Tctl|Tdie' | grep -oE '\\+[0-9]+\\.[0-9]+' | head -n1 | tr -d '+' | cut -d. -f1); [ -z \"$ctemp\" ] && ctemp=$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | head -n1 | awk '{print int($1/1000)}'); echo \"${ctemp:-0}\"; " +
+            "powerprofilesctl get 2>/dev/null || echo 'balanced'; " +                                            // 4 power profile
+            "cut -d. -f1 /proc/uptime 2>/dev/null || echo '0'; " +                                               // 5 uptime SECONDS
+            "wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null | awk '{print int($2*100), ($3==\"[MUTED]\"?\"off\":\"on\")}' || echo '0 on'; " + // 6 vol
+            "brightnessctl -m 2>/dev/null | awk -F, '{print substr($4, 1, length($4)-1)}' || echo '0'; " +       // 7 brightness
+            "cat /sys/class/drm/card*/device/gpu_busy_percent 2>/dev/null | head -1 || { nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | grep -E '^[0-9]+$' || echo '0'; }; " + // 8 gpu%
+            // 9 GPU VRAM percent: try amdgpu sysfs (used/total bytes), then nvidia-smi.
+            "vused=$(cat /sys/class/drm/card*/device/mem_info_vram_used 2>/dev/null | head -1); vtot=$(cat /sys/class/drm/card*/device/mem_info_vram_total 2>/dev/null | head -1); " +
+            "if [ -n \"$vused\" ] && [ -n \"$vtot\" ] && [ \"$vtot\" -gt 0 ]; then echo $((vused*100/vtot)); " +
+            "else nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | awk -F', ' 'NR==1{if($2>0) print int($1*100/$2); else print 0}' || echo '0'; fi; " +
+            // 10 GPU temp (°C): amdgpu edge sensor, then nvidia-smi.
+            "gtemp=$(sensors 2>/dev/null | grep -m1 -E 'edge|junction' | grep -oE '\\+[0-9]+\\.[0-9]+' | head -n1 | tr -d '+' | cut -d. -f1); [ -z \"$gtemp\" ] && gtemp=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -1); echo \"${gtemp:-0}\"; " +
+            // 11 network cumulative bytes: sum rx and tx across real interfaces.
+            "rx=0; tx=0; for d in /sys/class/net/*; do n=$(basename $d); [ \"$n\" = lo ] && continue; r=$(cat $d/statistics/rx_bytes 2>/dev/null||echo 0); t=$(cat $d/statistics/tx_bytes 2>/dev/null||echo 0); rx=$((rx+r)); tx=$((tx+t)); done; echo \"$rx $tx\"; " +
+            // 12 CPU fan %: first fan RPM from `sensors`, scaled against a 3000-RPM max.
+            "crpm=$(sensors 2>/dev/null | grep -m1 -iE 'fan[0-9]*:' | grep -oE '[0-9]+' | head -n1); [ -z \"$crpm\" ] && crpm=0; echo $(( crpm > 3000 ? 100 : crpm*100/3000 )); " +
+            // 13 GPU fan %: nvidia-smi fan.speed (already %), else amdgpu pwm1 (0-255).
+            "gfan=$(nvidia-smi --query-gpu=fan.speed --format=csv,noheader,nounits 2>/dev/null | head -1 | grep -oE '[0-9]+'); if [ -z \"$gfan\" ]; then p=$(cat /sys/class/drm/card*/device/hwmon/hwmon*/pwm1 2>/dev/null | head -1); [ -n \"$p\" ] && gfan=$((p*100/255)) || gfan=0; fi; echo \"${gfan:-0}\"; " +
+            // 14 system storage used %: root filesystem.
+            "df / 2>/dev/null | awk 'NR==2 {print $5}' | tr -d '%' || echo '0'; " +
+            // 15 NAS storage used %: ADJUST the mount path below to your NAS mount.
+            "df '/mnt/nas' 2>/dev/null | awk 'NR==2 {print $5}' | tr -d '%' || echo '0'"
         ]
         running: true
         stdout: StdioCollector {
@@ -212,19 +262,20 @@ Item {
                     window.diskUsage = parseInt(lines[2]) || 0;
                     widgetCache.diskUsage = window.diskUsage;
 
-                    window.sysTemp = parseInt(lines[3]) || 0;
-                    widgetCache.sysTemp = window.sysTemp;
-                    
+                    window.cpuTemp = parseInt(lines[3]) || 0;
+                    widgetCache.cpuTemp = window.cpuTemp;
+
                     window.powerProfile = lines[4];
                     widgetCache.powerProfile = window.powerProfile;
-                    
-                    let upParts = lines[5].split("h ");
-                    if (upParts.length === 2) {
-                        window.upHours = parseInt(upParts[0]) || 0;
-                        widgetCache.upHours = window.upHours;
-                        window.upMins = parseInt(upParts[1].replace("m", "")) || 0;
-                        widgetCache.upMins = window.upMins;
-                    }
+
+                    // Uptime in seconds → hours/mins (kept for any text) + the
+                    // 2-week gauge fraction.
+                    let upSec = parseInt(lines[5]) || 0;
+                    window.uptimeSec = upSec;
+                    window.upHours = Math.floor(upSec / 3600);
+                    widgetCache.upHours = window.upHours;
+                    window.upMins = Math.floor((upSec % 3600) / 60);
+                    widgetCache.upMins = window.upMins;
 
                     if (!window.isDraggingVol) {
                         let volParts = (lines[6] || "0 on").trim().split(" ");
@@ -233,7 +284,7 @@ Item {
                         window.sysMuted = (volParts[1] === "off");
                         widgetCache.sysMuted = window.sysMuted;
                     }
-                    
+
                     if (!window.isDraggingBri) {
                         window.sysBrightness = parseInt(lines[7]) || 0;
                         widgetCache.sysBrightness = window.sysBrightness;
@@ -243,15 +294,124 @@ Item {
                         window.gpuUsage = parseInt(lines[8]) || 0;
                         widgetCache.gpuUsage = window.gpuUsage;
                     }
+                    if (lines.length >= 10) {
+                        window.gpuVram = parseInt(lines[9]) || 0;
+                        widgetCache.gpuVram = window.gpuVram;
+                    }
+                    if (lines.length >= 11) {
+                        window.gpuTemp = parseInt(lines[10]) || 0;
+                        widgetCache.gpuTemp = window.gpuTemp;
+                    }
+                    if (lines.length >= 12) {
+                        let nb = (lines[11] || "0 0").trim().split(" ");
+                        let rx = parseFloat(nb[0]) || 0;
+                        let tx = parseFloat(nb[1]) || 0;
+                        let now = Date.now() / 1000;
+                        if (window._netPrevRx >= 0 && now > window._netPrevT) {
+                            let dt = now - window._netPrevT;
+                            window.netDownStr = window.fmtRate((rx - window._netPrevRx) / dt);
+                            window.netUpStr = window.fmtRate((tx - window._netPrevTx) / dt);
+                        }
+                        window._netPrevRx = rx; window._netPrevTx = tx; window._netPrevT = now;
+                    }
+                    // Side-arc data (lines 12–15). Clamp to 0–100.
+                    function clampPct(v) { v = parseInt(v) || 0; return v < 0 ? 0 : (v > 100 ? 100 : v); }
+                    if (lines.length >= 16) {
+                        window.cpuFanPct = clampPct(lines[12]);
+                        window.gpuFanPct = clampPct(lines[13]);
+                        window.sysStoragePct = clampPct(lines[14]);
+                        window.nasStoragePct = clampPct(lines[15]);
+                    }
                 }
             }
         }
     }
-
-    Timer {
-        interval: 1500; running: true; repeat: true; triggeredOnStart: true;
-        onTriggered: sysPoller.running = true
+    // Format a bytes/sec rate compactly (B/s, KB/s, MB/s).
+    function fmtRate(bps) {
+        if (!bps || bps < 0) bps = 0;
+        if (bps < 1024) return Math.round(bps) + " B/s";
+        if (bps < 1024 * 1024) return (bps / 1024).toFixed(1) + " KB/s";
+        return (bps / (1024 * 1024)).toFixed(2) + " MB/s";
     }
+
+    // ── 2-week maintenance gauge support ──
+    // Tick uptime forward locally so the gauge advances smoothly between polls.
+    Timer { interval: 1000; repeat: true; running: true; onTriggered: if (window.uptimeSec > 0) window.uptimeSec += 1 }
+
+    property bool auditRunning: false
+    property string auditResult: ""
+    // Run arch-audit — a REAL vulnerability check against the Arch security
+    // tracker (lists installed packages with known CVEs). This is the honest
+    // alternative to "AI scans for malware", which cannot reliably detect it.
+    function runArchAudit() {
+        window.auditRunning = true; window.auditResult = "";
+        archAuditProc.command = ["bash", "-c",
+            "if ! command -v arch-audit >/dev/null 2>&1; then echo 'arch-audit not installed — run: sudo pacman -S arch-audit'; exit 0; fi; " +
+            "OUT=$(arch-audit -u 2>/dev/null); " +
+            "if [ -z \"$OUT\" ]; then echo 'No known-vulnerable packages.'; else echo \"$OUT\" | head -8; fi"
+        ];
+        archAuditProc.running = false; archAuditProc.running = true;
+    }
+    Process { id: archAuditProc; command: ["bash", "-c", "true"]
+        stdout: StdioCollector { onStreamFinished: {
+            window.auditRunning = false;
+            window.auditResult = (this.text || "").trim() || "Audit finished.";
+        }}
+    }
+    // Update + reboot is an explicit, user-initiated action launched in a
+    // terminal so the user SEES the upgrade and can intervene (.pacnew merges,
+    // keyring prompts). It never runs unattended. We don't reboot for you — the
+    // upgrade command ends by telling you to reboot when ready.
+    function runUpdateReboot() {
+        Quickshell.execDetached(["bash", "-c",
+            "kitty --hold sh -c 'echo \"Review the upgrade below. Reboot yourself when it completes cleanly.\"; sudo pacman -Syu' " +
+            ">/dev/null 2>&1 || " +
+            "alacritty --hold -e sh -c 'sudo pacman -Syu' >/dev/null 2>&1 || " +
+            "foot sh -c 'sudo pacman -Syu; echo Done. Reboot when ready.; read' >/dev/null 2>&1 || true"
+        ]);
+    }
+
+    // ── System maintenance (the "update" button) ───────────────────────────
+    // Safe flow: clicking "update" runs a READ-ONLY preview (checkupdates,
+    // pacman -Qdt, arch-audit — none need root or touch the DB). The actual
+    // update/clean/orphan-removal each open a visible kitty terminal where the
+    // user types their sudo password and watches. Nothing destructive is silent.
+    property bool maintOpen: false
+    property bool maintChecking: false
+    property int  maintUpdates: 0
+    property int  maintOrphans: 0
+    property int  maintVulns: 0
+    property string maintDetail: ""
+    readonly property string maintScript: "~/.config/hypr/scripts/quickshell/battery/sysmaintain.sh"
+
+    function maintCheck() {
+        window.maintOpen = true;
+        window.maintChecking = true;
+        maintCheckProc.running = false; maintCheckProc.running = true;
+    }
+    function maintRun(action) {
+        // action: "update" | "clean" | "orphans" — opens a terminal via the helper.
+        Quickshell.execDetached(["bash", "-c", "bash " + window.maintScript + " " + action]);
+    }
+    // Read-only preview. Runs the helper's `check`, then reads the JSON it writes.
+    Process {
+        id: maintCheckProc
+        command: ["bash", "-c", "bash " + maintScript + " check; cat ~/.cache/qs_sysmaintain.json 2>/dev/null"]
+        stdout: StdioCollector { onStreamFinished: {
+            window.maintChecking = false;
+            try {
+                let txt = this.text.trim();
+                let brace = txt.lastIndexOf("{");
+                if (brace >= 0) txt = txt.substring(brace);
+                let d = JSON.parse(txt);
+                window.maintUpdates = d.updates || 0;
+                window.maintOrphans = d.orphans || 0;
+                window.maintVulns   = d.vulns || 0;
+                window.maintDetail  = d.detail || "";
+            } catch(e) { window.maintDetail = "Check failed: " + e; }
+        } }
+    }
+
 
     // ── Focus mode reader + countdown ──
     Process {
@@ -421,18 +581,24 @@ Item {
 
             RowLayout {
                 anchors.fill: parent
-                spacing: window.s(15) // Seamless separation instead of a line
+                anchors.leftMargin: window.s(10)
+                anchors.rightMargin: window.s(4)
+                spacing: window.s(12) // Seamless separation instead of a line
 
                 // ==========================================
                 // LEFT SIDE: NOTIFICATION CENTER
                 // ==========================================
                 Item {
-                    Layout.preferredWidth: window.s(320)
+                    opacity: window.maintOpen ? 0 : 1
+                    visible: opacity > 0.01
+                    Behavior on opacity { NumberAnimation { duration: 200; easing.type: Easing.InCubic } }
+                    Layout.preferredWidth: window.maintOpen ? 0 : window.s(300)
+                    Behavior on Layout.preferredWidth { NumberAnimation { duration: 240; easing.type: Easing.InOutCubic } }
                     Layout.fillHeight: true
 
                     ColumnLayout {
                         anchors.fill: parent
-                        anchors.margins: window.s(20)
+                        anchors.margins: window.s(14)
                         spacing: window.s(15)
 
                         // --- Notification Header & DND Toggle ---
@@ -751,7 +917,10 @@ Item {
                 // RIGHT SIDE: SYSTEM RESOURCES CORE
                 // ==========================================
                 Item {
-                    Layout.preferredWidth: window.s(480)
+                    opacity: window.maintOpen ? 0 : 1
+                    visible: opacity > 0.01
+                    Behavior on opacity { NumberAnimation { duration: 200; easing.type: Easing.InCubic } }
+                    Layout.fillWidth: true
                     Layout.fillHeight: true
 
                     // Radar Rings
@@ -840,6 +1009,52 @@ Item {
                         }
                     }
 
+                    // "update" button — opens the maintenance preview/confirm panel.
+                    Rectangle {
+                        id: updateBtn
+                        anchors.top: parent.top; anchors.right: parent.right
+                        anchors.topMargin: window.s(20)
+                        anchors.rightMargin: window.s(20) + window.s(38) + window.s(10)
+                        z: 10
+                        width: updateText.implicitWidth + window.s(20)
+                        height: window.s(38); radius: window.s(12)
+                        color: updateMa.containsMouse ? window.surface1 : "transparent"
+                        border.color: updateMa.containsMouse ? window.surface2 : "transparent"
+
+                        transform: Translate { y: window.s(-20) * (1.0 - introTop) }
+                        opacity: introTop
+
+                        Behavior on color { ColorAnimation { duration: 150 } }
+                        Behavior on border.color { ColorAnimation { duration: 150 } }
+
+                        Row {
+                            anchors.centerIn: parent
+                            spacing: window.s(6)
+                            Text {
+                                visible: window.maintUpdates > 0
+                                text: "󰚰"
+                                font.family: "Iosevka Nerd Font"; font.pixelSize: window.s(14)
+                                color: window.peach
+                                anchors.verticalCenter: parent.verticalCenter
+                            }
+                            Text {
+                                id: updateText
+                                text: "update"
+                                font.family: "JetBrains Mono"; font.weight: Font.Medium
+                                font.pixelSize: window.s(8)
+                                color: updateMa.containsMouse ? window.mauve : window.peach
+                                anchors.verticalCenter: parent.verticalCenter
+                                Behavior on color { ColorAnimation { duration: 150 } }
+                            }
+                        }
+
+                        MouseArea {
+                            id: updateMa
+                            anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                            onClicked: window.maintCheck()
+                        }
+                    }
+
                     // Expanding top-right logout icon
                     Rectangle {
                         id: logoutBtn
@@ -897,6 +1112,86 @@ Item {
                         }
                     }
 
+                    // ── 2-week uptime gauge — at the top, between the screenshot
+                    // (left) and logout (right) buttons. Fills as uptime → 14 days.
+                    // At the threshold it surfaces an arch-audit (real CVE check) +
+                    // update action. It never auto-upgrades or reboots on its own. ──
+                    Item {
+                        id: uptimeGauge
+                        z: 10
+                        visible: !window.maintOpen   // hidden while the update panel is up
+                        opacity: window.maintOpen ? 0 : 1
+                        Behavior on opacity { NumberAnimation { duration: 200 } }
+                        anchors.top: parent.top
+                        anchors.topMargin: window.s(20)
+                        anchors.left: screenshotBtn.right
+                        anchors.right: updateBtn.left
+                        anchors.leftMargin: window.s(14)
+                        anchors.rightMargin: window.s(14)
+                        height: window.s(38)
+                        transform: Translate { y: window.s(-20) * (1.0 - introTop) }
+                        opacity: introTop
+                        property int twoWeeks: 14 * 24 * 3600
+                        property real frac: Math.min(1, window.uptimeSec / twoWeeks)
+                        property int daysLeft: Math.max(0, Math.ceil((twoWeeks - window.uptimeSec) / 86400))
+                        property bool due: window.uptimeSec >= twoWeeks
+
+                        Column {
+                            anchors.fill: parent; spacing: window.s(3)
+                            RowLayout {
+                                width: parent.width
+                                Text { text: uptimeGauge.due ? "Uptime 2wk — maintenance due" : "Uptime → 2wk maintenance"
+                                    font.family: "JetBrains Mono"; font.weight: Font.Bold; font.pixelSize: window.s(8)
+                                    color: uptimeGauge.due ? window.peach : window.subtext0 }
+                                Item { Layout.fillWidth: true }
+                                Text { text: uptimeGauge.due ? "now" : uptimeGauge.daysLeft + "d left"
+                                    font.family: "JetBrains Mono"; font.pixelSize: window.s(8); color: window.overlay1 }
+                            }
+                            // The bar — a single solid track now that it's at the top
+                            // (no longer interrupted by the center network circle).
+                            Rectangle {
+                                width: parent.width; height: window.s(8); radius: window.s(4)
+                                color: window.surface0; border.color: window.surface1; border.width: 1
+                                Rectangle {
+                                    x: 1; y: 1; height: parent.height - 2; radius: parent.radius
+                                    width: Math.max(0, (parent.width - 2) * uptimeGauge.frac)
+                                    color: uptimeGauge.due ? window.peach : window.ambientPrimary
+                                    Behavior on width { NumberAnimation { duration: 800; easing.type: Easing.OutQuint } }
+                                    Behavior on color { ColorAnimation { duration: 600 } }
+                                }
+                            }
+                            // Action row — only at threshold. Run arch-audit (real
+                            // CVE scan) and, separately, let the user update.
+                            RowLayout {
+                                width: parent.width; spacing: window.s(6)
+                                visible: uptimeGauge.due
+                                Rectangle { Layout.preferredWidth: auditRow.implicitWidth + window.s(14); Layout.preferredHeight: window.s(20); radius: window.s(6)
+                                    color: auditMa.containsMouse ? Qt.rgba(window.yellow.r, window.yellow.g, window.yellow.b, 0.2) : window.surface0
+                                    border.color: window.surface1; border.width: 1
+                                    Row { id: auditRow; anchors.centerIn: parent; spacing: window.s(4)
+                                        Text { text: window.auditRunning ? "󰦖" : "󰒃"; font.family: "Iosevka Nerd Font"; font.pixelSize: window.s(10); color: window.yellow; anchors.verticalCenter: parent.verticalCenter
+                                            RotationAnimation on rotation { running: window.auditRunning; loops: Animation.Infinite; from: 0; to: 360; duration: 1000 } }
+                                        Text { text: "Scan (arch-audit)"; font.family: "JetBrains Mono"; font.pixelSize: window.s(8); color: window.text; anchors.verticalCenter: parent.verticalCenter } }
+                                    MouseArea { id: auditMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: window.runArchAudit() }
+                                }
+                                Rectangle { Layout.preferredWidth: updRow.implicitWidth + window.s(14); Layout.preferredHeight: window.s(20); radius: window.s(6)
+                                    color: updMa.containsMouse ? Qt.rgba(window.green.r, window.green.g, window.green.b, 0.2) : window.surface0
+                                    border.color: window.surface1; border.width: 1
+                                    Row { id: updRow; anchors.centerIn: parent; spacing: window.s(4)
+                                        Text { text: "󰚰"; font.family: "Iosevka Nerd Font"; font.pixelSize: window.s(10); color: window.green; anchors.verticalCenter: parent.verticalCenter }
+                                        Text { text: "Update + reboot"; font.family: "JetBrains Mono"; font.pixelSize: window.s(8); color: window.text; anchors.verticalCenter: parent.verticalCenter } }
+                                    MouseArea { id: updMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: window.runUpdateReboot() }
+                                }
+                            }
+                            // Audit result line
+                            Text { width: parent.width; visible: window.auditResult !== ""
+                                text: window.auditResult
+                                font.family: "JetBrains Mono"; font.pixelSize: window.s(8)
+                                color: window.auditResult.indexOf("No ") === 0 ? window.green : window.peach
+                                wrapMode: Text.Wrap }
+                        }
+                    }
+
                     // ==========================================
                     // BIG SYSTEM RESOURCES GRID (DESKTOP)
                     // ==========================================
@@ -905,8 +1200,10 @@ Item {
                         columns: 2
                         spacing: window.s(25)
                         anchors.horizontalCenter: parent.horizontalCenter
-                        // Center vertically in the space between top and bottomDocks
-                        anchors.bottom: bottomDocks.top; anchors.bottomMargin: window.s(15) 
+                        // Centre vertically in the band between the header (uptime bar)
+                        // and the fastfetch card, so it doesn't overlap either.
+                        y: uptimeGauge.y + uptimeGauge.height + ((bottomDocks.y - (uptimeGauge.y + uptimeGauge.height)) - height) / 2
+                        anchors.horizontalCenterOffset: window.s(6)
                         z: 1
 
                         opacity: introCore
@@ -915,7 +1212,7 @@ Item {
 
                         // 1. CPU Orb
                         Item {
-                            id: cpuOrb; width: window.s(145); height: window.s(145)
+                            id: cpuOrb; width: window.s(165); height: window.s(165)
                             property real animVal: window.cpuUsage
                             Behavior on animVal { NumberAnimation { duration: 1200; easing.type: Easing.OutQuint } }
                             onAnimValChanged: cpuCanvas.requestPaint()
@@ -960,7 +1257,7 @@ Item {
 
                         // 2. RAM Orb
                         Item {
-                            id: ramOrb; width: window.s(145); height: window.s(145)
+                            id: ramOrb; width: window.s(165); height: window.s(165)
                             property real animVal: window.ramUsage
                             Behavior on animVal { NumberAnimation { duration: 1200; easing.type: Easing.OutQuint } }
                             onAnimValChanged: ramCanvas.requestPaint()
@@ -1005,7 +1302,7 @@ Item {
 
                         // 3. GPU Orb
                         Item {
-                            id: gpuOrb; width: window.s(145); height: window.s(145)
+                            id: gpuOrb; width: window.s(165); height: window.s(165)
                             property real animVal: window.gpuUsage
                             Behavior on animVal { NumberAnimation { duration: 1200; easing.type: Easing.OutQuint } }
                             onAnimValChanged: gpuCanvas.requestPaint()
@@ -1048,10 +1345,10 @@ Item {
                             MouseArea { id: gpuMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor }
                         }
 
-                        // 4. TEMP Orb
+                        // 4. GPU VRAM Orb (was system temp)
                         Item {
-                            id: tempOrb; width: window.s(145); height: window.s(145)
-                            property real animVal: window.sysTemp
+                            id: tempOrb; width: window.s(165); height: window.s(165)
+                            property real animVal: window.gpuVram
                             Behavior on animVal { NumberAnimation { duration: 1200; easing.type: Easing.OutQuint } }
                             onAnimValChanged: tempCanvas.requestPaint()
 
@@ -1063,7 +1360,7 @@ Item {
                                 anchors.centerIn: parent
                                 width: parent.width + (tempMa.containsMouse ? window.s(16) : window.s(4))
                                 height: width; radius: width / 2
-                                color: window.red
+                                color: window.teal
                                 opacity: tempMa.containsMouse ? 0.25 : 0.08
                                 Behavior on width { NumberAnimation { duration: 400; easing.type: Easing.OutExpo } }
                                 Behavior on opacity { NumberAnimation { duration: 300 } }
@@ -1077,7 +1374,7 @@ Item {
                                     var eA = (Math.min(100, Math.max(0, parent.animVal)) / 100) * 2 * Math.PI;
                                     ctx.lineCap = "round"; ctx.lineWidth = window.s(8); ctx.beginPath(); ctx.arc(cX, cY, rad, 0, 2*Math.PI); 
                                     ctx.strokeStyle = window.surface0.toString(); ctx.stroke();
-                                    var grad = ctx.createLinearGradient(0, height, width, 0); grad.addColorStop(0, window.red.toString()); grad.addColorStop(1, window.maroon.toString());
+                                    var grad = ctx.createLinearGradient(0, height, width, 0); grad.addColorStop(0, window.teal.toString()); grad.addColorStop(1, window.sapphire.toString());
                                     ctx.lineWidth = window.s(14); ctx.beginPath(); ctx.arc(cX, cY, rad, 0, eA); ctx.strokeStyle = grad; ctx.stroke();
                                 }
                             }
@@ -1085,18 +1382,194 @@ Item {
                                 anchors.centerIn: parent; spacing: 0
                                 RowLayout {
                                     Layout.alignment: Qt.AlignHCenter; spacing: window.s(4)
-                                    Text { font.family: "Iosevka Nerd Font"; font.pixelSize: window.s(18); color: window.red; text: "" }
-                                    Text { font.family: "JetBrains Mono"; font.weight: Font.Black; font.pixelSize: window.s(28); color: window.text; text: Math.round(tempOrb.animVal) + "°" }
+                                    Text { font.family: "Iosevka Nerd Font"; font.pixelSize: window.s(18); color: window.teal; text: "" }
+                                    Text { font.family: "JetBrains Mono"; font.weight: Font.Black; font.pixelSize: window.s(28); color: window.text; text: Math.round(tempOrb.animVal) + "%" }
                                 }
-                                Text { Layout.alignment: Qt.AlignHCenter; font.family: "JetBrains Mono"; font.weight: Font.Bold; font.pixelSize: window.s(12); color: window.subtext0; text: "SYSTEM TEMP" }
+                                Text { Layout.alignment: Qt.AlignHCenter; font.family: "JetBrains Mono"; font.weight: Font.Bold; font.pixelSize: window.s(12); color: window.subtext0; text: "GPU VRAM" }
                             }
                             MouseArea { id: tempMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor }
                         }
                     }
 
-                    // ==========================================
-                    // BOTTOM DOCKS
-                    // ── Uptime circle — centered on performance orbs ──
+                    // ── Temp gauges overlay ──
+                    // A single Canvas laid OVER sysGrid (not inside the Grid, so it can
+                    // draw across cells). Each temp stack sits in the LENS between a
+                    // row's two orbs:
+                    //   CPU  → between CPU LOAD (left) and MEMORY (right), top row
+                    //   GPU  → between GPU LOAD (left) and GPU VRAM (right), bottom row
+                    // The arc is symmetric about the gap midline and complementary to
+                    // both orbs (concentric with each orb's facing edge). Segments
+                    // appear by temp (30→90) and retract when either neighbour is
+                    // hovered. Grid is 315×315; orb centres at x=72.5 (left)/242.5
+                    // (right), rows at y=72.5 (top)/242.5 (bottom).
+                    Canvas {
+                        id: tempOverlay
+                        anchors.fill: sysGrid
+                        z: 5
+                        opacity: introCore
+                        property int cpuT: window.cpuTemp
+                        property int gpuT: window.gpuTemp
+                        // Either neighbour of a row hovering causes that row's stack to
+                        // retract (cpu row = CPU LOAD + MEMORY; gpu row = GPU LOAD + VRAM).
+                        property bool cpuHov: cpuMa.containsMouse || ramMa.containsMouse
+                        property bool gpuHov: gpuMa.containsMouse || tempMa.containsMouse
+                        onCpuTChanged: requestPaint()
+                        onGpuTChanged: requestPaint()
+                        onCpuHovChanged: requestPaint()
+                        onGpuHovChanged: requestPaint()
+                        onWidthChanged: requestPaint()
+                        onHeightChanged: requestPaint()
+                        Component.onCompleted: requestPaint()
+
+                        // Draw a symmetric lens stack in the gap between two orbs whose
+                        // centres are (lx,cy) and (rx,cy). Bars are arcs concentric with
+                        // the LEFT orb, mirrored to stay symmetric in the almond gap, and
+                        // Draw a SEGMENTED stack in the lens between two orbs. The gap
+                        // centre is midX; segments are distinct short curved ticks that
+                        // stack outward (up and down) from the centre — segment 0 (30°)
+                        // is a small dot at the middle, each higher step a wider tick
+                        // placed further out, so they read as separate bars, not a blob.
+                        function drawLensStack(ctx, lx, rx, cy, temp, hov, hotColdSwap) {
+                            var steps = 13;                       // 30,35,...,90
+                            var midX = (lx + rx) / 2;             // gap centre
+                            // Vertical room for the stack in ONE direction (shrinks a
+                            // little on hover so it pulls in as the orbs expand).
+                            var spanH = hov ? window.s(50) : window.s(58);
+                            var spacing = spanH / steps;       // 13 ticks spread over the span
+                            // Max tick half-width — bounded by the gap so ticks never
+                            // touch the orb rings.
+                            var orbEdge = hov ? window.s(90) : window.s(86);
+                            var gapHalf = (rx - lx) / 2 - orbEdge;
+                            if (gapHalf < window.s(4)) gapHalf = window.s(4);
+                            // Stack direction: top row (CPU) grows UP (-1), bottom row
+                            // (GPU) grows DOWN (+1) — i.e. outward from the centre.
+                            var outDir = hotColdSwap ? 1 : -1;
+                            ctx.lineCap = "round";
+                            for (var i = 0; i < steps; i++) {
+                                var threshold = 30 + i * 5;
+                                if (temp < threshold) continue;
+                                var t = i / (steps - 1);
+                                // Stack in ONE direction only (outward, away from the
+                                // central network circle): `outDir` is -1 for the top
+                                // row (stack upward) and +1 for the bottom row (downward).
+                                // Start one spacing out from centre so the first tick
+                                // begins where the second used to sit.
+                                var yPos = cy + outDir * (i + 1) * spacing;
+                                // Tick half-width grows with temperature; capped to gap.
+                                // i=0 (30°) is a tiny dot; width ramps up from there.
+                                var hw = Math.min(gapHalf, window.s(2 + t * 17));
+                                var col = t > 0.75 ? window.red
+                                        : t > 0.5 ? window.peach
+                                        : t > 0.28 ? window.yellow
+                                        : (hotColdSwap ? window.sapphire : window.teal);
+                                ctx.lineWidth = window.s(2.5 + t * 3.5);
+                                ctx.strokeStyle = col.toString();
+                                // A short curved tick: bows vertically a touch so the
+                                // stack as a whole follows the lens curvature.
+                                var bow = (yPos - cy) * 0.12;          // subtle lens bow
+                                ctx.beginPath();
+                                ctx.moveTo(midX - hw, yPos);
+                                ctx.quadraticCurveTo(midX, yPos + bow, midX + hw, yPos);
+                                ctx.stroke();
+                            }
+                        }
+                        onPaint: {
+                            var ctx = getContext("2d"); ctx.clearRect(0, 0, width, height);
+                            var lx = window.s(82.5);              // left column orb centre x
+                            var rx = window.s(272.5);             // right column orb centre x
+                            var topY = window.s(82.5);            // top row centre y
+                            var botY = window.s(272.5);           // bottom row centre y
+                            drawLensStack(ctx, lx, rx, topY, tempOverlay.cpuT, tempOverlay.cpuHov, false);
+                            drawLensStack(ctx, lx, rx, botY, tempOverlay.gpuT, tempOverlay.gpuHov, true);
+                        }
+                    }
+
+                    // ── Side stacks ───────────────────────────────────────────
+                    // Same visual style as the temperature lens stacks, but placed
+                    // in the VERTICAL gap of each column and split down the middle
+                    // into two halves (top metric grows up, bottom metric grows down):
+                    //   Left column  : top = CPU fan,        bottom = GPU fan
+                    //   Right column : top = system storage, bottom = NAS storage
+                    Canvas {
+                        id: sideArcs
+                        anchors.fill: sysGrid
+                        z: 4
+                        opacity: introCore
+                        property int cpuFan: window.cpuFanPct
+                        property int gpuFan: window.gpuFanPct
+                        property int sysSt:  window.sysStoragePct
+                        property int nasSt:  window.nasStoragePct
+                        property bool leftHov: cpuMa.containsMouse || gpuMa.containsMouse
+                        property bool rightHov: ramMa.containsMouse || tempMa.containsMouse
+                        onCpuFanChanged: requestPaint()
+                        onGpuFanChanged: requestPaint()
+                        onSysStChanged: requestPaint()
+                        onNasStChanged: requestPaint()
+                        onLeftHovChanged: requestPaint()
+                        onRightHovChanged: requestPaint()
+                        onWidthChanged: requestPaint()
+                        onHeightChanged: requestPaint()
+                        Component.onCompleted: requestPaint()
+
+                        // One HALF of a vertical stack, in the same tick style as the
+                        // temp lens. cx = column centre x; cyGap = vertical gap centre;
+                        // tY/bY = the two orb centres (top, bottom) bounding the gap.
+                        // pct (0–100) fills segments; outDir -1 = grow up, +1 = down.
+                        // colCool/colWarm pick the low→high colour ramp.
+                        function drawSideHalf(ctx, cx, cyGap, tY, bY, pct, outDir, hov, colCool) {
+                            var steps = 13;
+                            // Vertical room from the gap centre to the nearer orb edge.
+                            var orbEdge = hov ? window.s(90) : window.s(86);
+                            var halfGap = (bY - tY) / 2 - orbEdge;
+                            if (halfGap < window.s(4)) halfGap = window.s(4);
+                            var spanV = hov ? window.s(50) : window.s(58);
+                            // Don't exceed the available half-gap.
+                            if (spanV > halfGap * 2) spanV = halfGap * 2;
+                            var spacing = spanV / steps;
+                            var p = Math.max(0, Math.min(100, pct)) / 100;
+                            ctx.lineCap = "round";
+                            for (var i = 0; i < steps; i++) {
+                                // Fill segments proportional to pct (like temp uses
+                                // threshold; here we light the first p*steps ticks).
+                                if (i / steps >= p) continue;
+                                var t = i / (steps - 1);
+                                // The gap is vertical, so ticks are short VERTICAL bars
+                                // stacked along Y, bowing horizontally toward the column.
+                                var yPos = cyGap + outDir * (i + 1) * spacing;
+                                var hh = Math.min(halfGap, window.s(2 + t * 17)); // tick half-length
+                                var col = t > 0.75 ? window.red
+                                        : t > 0.5 ? window.peach
+                                        : t > 0.28 ? window.yellow
+                                        : colCool;
+                                ctx.lineWidth = window.s(2.5 + t * 3.5);
+                                ctx.strokeStyle = col.toString();
+                                var bow = (yPos - cyGap) * 0.12;
+                                // Vertical tick that bows horizontally toward the column.
+                                ctx.beginPath();
+                                ctx.moveTo(cx, yPos - hh);
+                                ctx.quadraticCurveTo(cx + bow, yPos, cx, yPos + hh);
+                                ctx.stroke();
+                            }
+                        }
+
+                        onPaint: {
+                            var ctx = getContext("2d"); ctx.clearRect(0, 0, width, height);
+                            var leftX  = window.s(82.5);
+                            var rightX = window.s(272.5);
+                            var tY = window.s(82.5);    // top-row orb centre
+                            var bY = window.s(272.5);   // bottom-row orb centre
+                            var gapMid = window.s(177.5);
+
+                            // LEFT column gap: top half (up) = CPU fan, bottom (down) = GPU fan.
+                            drawSideHalf(ctx, leftX, gapMid, tY, bY, sideArcs.cpuFan, -1, sideArcs.leftHov, window.sapphire);
+                            drawSideHalf(ctx, leftX, gapMid, tY, bY, sideArcs.gpuFan, +1, sideArcs.leftHov, window.teal);
+                            // RIGHT column gap: top half (up) = system storage, bottom (down) = NAS.
+                            drawSideHalf(ctx, rightX, gapMid, tY, bY, sideArcs.sysSt, -1, sideArcs.rightHov, window.sapphire);
+                            drawSideHalf(ctx, rightX, gapMid, tY, bY, sideArcs.nasSt, +1, sideArcs.rightHov, window.teal);
+                        }
+                    }
+
+                    // ── Uptime circle (network up/down) — centered on the orbs ──
                     Rectangle {
                         id: uptimeCircle
                         width: window.s(52); height: window.s(52)
@@ -1104,7 +1577,7 @@ Item {
                         color: window.surface0
                         border.color: window.surface1
                         border.width: 1
-                        z: 5
+                        z: 7
 
                         // Center on the sysGrid
                         anchors.centerIn: sysGrid
@@ -1122,57 +1595,18 @@ Item {
 
                         property int totalSecs: window.upHours * 3600 + window.upMins * 60
                         property int totalMins: window.upHours * 60 + window.upMins
-                        property string uptimeVal: {
-                            let s = totalSecs;
-                            let m = totalMins;
-                            let h = window.upHours;
-                            let d = Math.floor(h / 24);
-                            let w = Math.floor(d / 7);
-                            let mo = Math.floor(d / 30);
 
-                            if (mo >= 1) return mo.toString();
-                            if (w >= 1)  return w.toString();
-                            if (d >= 1)  return d.toString();
-                            if (h >= 1)  return h.toString();
-                            if (m >= 1)  return m.toString();
-                            return s.toString();
-                        }
-                        property string uptimeUnit: {
-                            let s = totalSecs;
-                            let m = totalMins;
-                            let h = window.upHours;
-                            let d = Math.floor(h / 24);
-                            let w = Math.floor(d / 7);
-                            let mo = Math.floor(d / 30);
-
-                            if (mo >= 1) return "MO";
-                            if (w >= 1)  return "WK";
-                            if (d >= 1)  return "DAY";
-                            if (h >= 1)  return "HR";
-                            if (m >= 1)  return "MIN";
-                            return "SEC";
-                        }
-
+                        // Network up/down replaces the old uptime counter.
                         Column {
                             anchors.centerIn: parent
-                            spacing: window.s(-2)
-
-                            Text {
-                                anchors.horizontalCenter: parent.horizontalCenter
-                                text: uptimeCircle.uptimeVal
-                                font.family: "JetBrains Mono"
-                                font.weight: Font.Black
-                                font.pixelSize: window.s(16)
-                                color: window.ambientPrimary
-                                Behavior on color { ColorAnimation { duration: 1000 } }
+                            spacing: window.s(1)
+                            Row { anchors.horizontalCenter: parent.horizontalCenter; spacing: window.s(3)
+                                Text { text: "󰇚"; font.family: "Iosevka Nerd Font"; font.pixelSize: window.s(11); color: window.green; anchors.verticalCenter: parent.verticalCenter }
+                                Text { text: window.netDownStr; font.family: "JetBrains Mono"; font.weight: Font.Bold; font.pixelSize: window.s(8); color: window.text; anchors.verticalCenter: parent.verticalCenter }
                             }
-                            Text {
-                                anchors.horizontalCenter: parent.horizontalCenter
-                                text: uptimeCircle.uptimeUnit
-                                font.family: "JetBrains Mono"
-                                font.weight: Font.Bold
-                                font.pixelSize: window.s(8)
-                                color: window.subtext0
+                            Row { anchors.horizontalCenter: parent.horizontalCenter; spacing: window.s(3)
+                                Text { text: "󰕒"; font.family: "Iosevka Nerd Font"; font.pixelSize: window.s(11); color: window.blue; anchors.verticalCenter: parent.verticalCenter }
+                                Text { text: window.netUpStr; font.family: "JetBrains Mono"; font.weight: Font.Bold; font.pixelSize: window.s(8); color: window.text; anchors.verticalCenter: parent.verticalCenter }
                             }
                         }
                     }
@@ -1257,6 +1691,7 @@ Item {
                             Layout.fillWidth: true
                             Layout.preferredHeight: window.s(58)
                             radius: window.s(14)
+                            clip: true
                             color: window.surface0
                             border.color: window.surface1
                             border.width: 1
@@ -1408,8 +1843,8 @@ Item {
                             RowLayout {
                                 id: timeSetter
                                 anchors.fill: parent
-                                anchors.margins: window.s(10)
-                                spacing: window.s(8)
+                                anchors.margins: 0
+                                spacing: 0
                                 visible: parent.showTimeSetter
                                 opacity: visible ? 1 : 0
                                 Behavior on opacity { NumberAnimation { duration: 250 } }
@@ -1418,7 +1853,7 @@ Item {
                                 Rectangle {
                                     Layout.preferredWidth: window.s(44)
                                     Layout.fillHeight: true
-                                    radius: window.s(8)
+                                    radius: 0
                                     color: minusMa.containsMouse ? window.surface1 : window.surface0
                                     border.color: minusMa.containsMouse ? window.surface2 : window.surface1
                                     border.width: 1
@@ -1439,7 +1874,7 @@ Item {
                                 Rectangle {
                                     Layout.fillWidth: true
                                     Layout.fillHeight: true
-                                    radius: window.s(8)
+                                    radius: 0
                                     color: lockMa.containsMouse ? window.surface1 : window.surface0
                                     border.color: lockMa.containsMouse
                                         ? (window.pendingFocusMode === "gaming" ? window.red : window.green)
@@ -1502,7 +1937,7 @@ Item {
                                 Rectangle {
                                     Layout.preferredWidth: window.s(44)
                                     Layout.fillHeight: true
-                                    radius: window.s(8)
+                                    radius: 0
                                     color: plusMa.containsMouse ? window.surface1 : window.surface0
                                     border.color: plusMa.containsMouse ? window.surface2 : window.surface1
                                     border.width: 1
@@ -1796,9 +2231,144 @@ Item {
                         }
 
 
+                    // ── System maintenance overlay (preview + confirm actions) ──
+                        }
                     }
                 }
+
+                    Rectangle {
+                        id: maintOverlay
+                        anchors.fill: parent
+                        z: 200
+                        visible: opacity > 0.01
+                        opacity: window.maintOpen ? 1 : 0
+                        // Fade in slightly slower than the modules fade out, so the
+                        // panel arrives just as the modules finish clearing.
+                        Behavior on opacity { NumberAnimation { duration: 280; easing.type: Easing.OutCubic } }
+                        color: Qt.rgba(window.crust.r, window.crust.g, window.crust.b, 0.92)
+
+                        // Click outside the card closes it.
+                        MouseArea { anchors.fill: parent; onClicked: window.maintOpen = false }
+
+                        Rectangle {
+                            anchors.centerIn: parent
+                            width: Math.min(parent.width - window.s(40), window.s(420))
+                            height: Math.min(parent.height - window.s(40), window.s(440))
+                            radius: window.s(16)
+                            color: window.base
+                            border.color: window.surface1; border.width: 1
+                            // Swallow clicks so they don't close via the backdrop.
+                            MouseArea { anchors.fill: parent }
+
+                            Column {
+                                anchors.fill: parent
+                                anchors.margins: window.s(18)
+                                spacing: window.s(12)
+
+                                // Header
+                                Item {
+                                    width: parent.width; height: window.s(26)
+                                    Text {
+                                        anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter
+                                        text: "System Maintenance"
+                                        font.family: "JetBrains Mono"; font.weight: Font.Bold; font.pixelSize: window.s(15)
+                                        color: window.text
+                                    }
+                                    Text {
+                                        anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+                                        text: "󰅖"; font.family: "Iosevka Nerd Font"; font.pixelSize: window.s(16)
+                                        color: closeMa.containsMouse ? window.red : window.subtext0
+                                        MouseArea { id: closeMa; anchors.fill: parent; anchors.margins: -window.s(6); hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: window.maintOpen = false }
+                                    }
+                                }
+
+                                // Summary counts
+                                Row {
+                                    width: parent.width; spacing: window.s(10)
+                                    visible: !window.maintChecking
+                                    Repeater {
+                                        model: [
+                                            { lbl: "Updates", val: window.maintUpdates, col: window.maintUpdates > 0 ? window.peach : window.green },
+                                            { lbl: "Orphans", val: window.maintOrphans, col: window.maintOrphans > 0 ? window.yellow : window.green },
+                                            { lbl: "Vulns",   val: window.maintVulns,   col: window.maintVulns   > 0 ? window.red : window.green }
+                                        ]
+                                        Rectangle {
+                                            width: (parent.width - window.s(20)) / 3; height: window.s(54)
+                                            radius: window.s(10); color: window.surface0
+                                            Column {
+                                                anchors.centerIn: parent; spacing: window.s(2)
+                                                Text { anchors.horizontalCenter: parent.horizontalCenter; text: modelData.val; font.family: "JetBrains Mono"; font.weight: Font.Bold; font.pixelSize: window.s(18); color: modelData.col }
+                                                Text { anchors.horizontalCenter: parent.horizontalCenter; text: modelData.lbl; font.family: "JetBrains Mono"; font.pixelSize: window.s(9); color: window.text }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Checking spinner / detail text
+                                Text {
+                                    width: parent.width; visible: window.maintChecking
+                                    text: "Checking… (read-only, nothing changed)"
+                                    font.family: "JetBrains Mono"; font.pixelSize: window.s(11); color: window.text
+                                }
+
+                                Rectangle {
+                                    width: parent.width
+                                    height: parent.height - window.s(190)
+                                    radius: window.s(10); color: window.mantle
+                                    visible: !window.maintChecking
+                                    clip: true
+                                    Flickable {
+                                        anchors.fill: parent; anchors.margins: window.s(10)
+                                        contentWidth: width; contentHeight: detailText.implicitHeight
+                                        clip: true
+                                        Text {
+                                            id: detailText
+                                            width: parent.width
+                                            text: window.maintDetail
+                                            font.family: "JetBrains Mono"; font.pixelSize: window.s(10)
+                                            color: window.text; wrapMode: Text.Wrap
+                                        }
+                                    }
+                                }
+
+                                // Action buttons — each opens a visible terminal (sudo).
+                                Row {
+                                    width: parent.width; spacing: window.s(8)
+                                    visible: !window.maintChecking
+
+                                    Repeater {
+                                        model: [
+                                            { lbl: "Update", act: "update", col: window.mauve, show: true },
+                                            { lbl: "Orphans", act: "orphans", col: window.yellow, show: window.maintOrphans > 0 },
+                                            { lbl: "Clean", act: "clean", col: window.sky, show: true }
+                                        ]
+                                        Rectangle {
+                                            visible: modelData.show
+                                            width: modelData.show ? (parent.width - window.s(16)) / 3 : 0
+                                            height: window.s(34); radius: window.s(10)
+                                            color: abtnMa.containsMouse ? Qt.rgba(modelData.col.r, modelData.col.g, modelData.col.b, 0.22) : window.surface0
+                                            border.color: abtnMa.containsMouse ? modelData.col : window.surface1; border.width: 1
+                                            Behavior on color { ColorAnimation { duration: 120 } }
+                                            Text {
+                                                anchors.centerIn: parent; text: modelData.lbl
+                                                font.family: "JetBrains Mono"; font.weight: Font.Medium; font.pixelSize: window.s(11)
+                                                color: abtnMa.containsMouse ? modelData.col : window.text
+                                            }
+                                            MouseArea {
+                                                id: abtnMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                                                onClicked: {
+                                                    window.maintRun(modelData.act);
+                                                    window.maintOpen = false;
+                                                    // Close the whole battery popup so the kitty terminal is unobstructed.
+                                                    Quickshell.execDetached(["sh", "-c", "echo 'close' > /tmp/qs_widget_state"]);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
             }
         }
     }
-}
