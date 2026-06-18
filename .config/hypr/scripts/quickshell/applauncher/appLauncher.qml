@@ -16,9 +16,14 @@ Item {
         id: scaler
         currentWidth: Screen.width
     }
-    
-    function s(val) { 
-        return scaler.s(val); 
+
+    // Launcher magnification. The launcher's content was sized for the old 800×700
+    // window; the window is now 560×440 (same as the "tools" popup). Scaling every s()
+    // value by 560/800 = 0.7 shrinks the whole UI uniformly to fit — same layout, lower
+    // magnification — instead of reformatting anything.
+    property real uiMag: 0.7
+    function s(val) {
+        return scaler.s(val) * window.uiMag;
     }
 
     // -------------------------------------------------------------------------
@@ -52,6 +57,85 @@ Item {
     // STATE & LOGIC
     // -------------------------------------------------------------------------
     property var allApps: []
+
+    // ── Focus-mode assignment state (shared with the TopBar dock) ───────────
+    // Persisted in ~/.cache/qs_dock_state.json so the TopBar dock reads the same
+    // assignments. We store a command key (basename of the app's exec) because the
+    // dock matches apps by their launch command, not their display name.
+    //   gaming       : command keys assigned to Gaming (show ONLY in gaming mode)
+    //   studyRemoved : command keys removed from Study (hidden in study mode)
+    property var gamingApps: []
+    property var studyRemoved: []
+    property string focusMode: "default"
+
+    // Reduce an exec string to a comparable command key, e.g.
+    // "/usr/bin/steam %U" → "steam", "env FOO=1 brave --flag" → "brave".
+    function _cmdKey(execStr) {
+        if (!execStr) return "";
+        let parts = execStr.trim().split(/\s+/);
+        let i = 0;
+        // skip env-style prefixes
+        while (i < parts.length && (parts[i] === "env" || parts[i].indexOf("=") >= 0)) i++;
+        let bin = parts[i] || "";
+        let slash = bin.lastIndexOf("/");
+        if (slash >= 0) bin = bin.substring(slash + 1);
+        return bin.toLowerCase();
+    }
+
+    function _inList(list, key) {
+        for (let i = 0; i < list.length; i++) if (list[i] === key) return true;
+        return false;
+    }
+    function appVisibleInMode(execStr) {
+        let key = window._cmdKey(execStr);
+        if (window.focusMode === "gaming") return true;
+        if (window._inList(window.gamingApps, key)) return false;
+        if (window.focusMode === "study" && window._inList(window.studyRemoved, key)) return false;
+        return true;
+    }
+
+    function saveDockState() {
+        let obj = { gaming: window.gamingApps, studyRemoved: window.studyRemoved };
+        let json = JSON.stringify(obj).replace(/'/g, "'\\''");
+        Quickshell.execDetached(["bash", "-c",
+            "mkdir -p ~/.cache && printf '%s' '" + json + "' > ~/.cache/qs_dock_state.json"]);
+    }
+    function toggleGaming(key) {
+        if (window._inList(window.gamingApps, key)) window.gamingApps = window.gamingApps.filter(n => n !== key);
+        else window.gamingApps = window.gamingApps.concat([key]);
+        window.saveDockState(); window.filterApps(searchInput.text || "");
+    }
+    function toggleStudyRemoved(key) {
+        if (window._inList(window.studyRemoved, key)) window.studyRemoved = window.studyRemoved.filter(n => n !== key);
+        else window.studyRemoved = window.studyRemoved.concat([key]);
+        window.saveDockState(); window.filterApps(searchInput.text || "");
+    }
+
+    Process {
+        id: dockStateReader; running: true
+        command: ["bash", "-c", "cat ~/.cache/qs_dock_state.json 2>/dev/null || echo '{}'"]
+        stdout: StdioCollector { onStreamFinished: {
+            try {
+                let d = JSON.parse(this.text);
+                window.gamingApps = d.gaming || [];
+                window.studyRemoved = d.studyRemoved || [];
+            } catch(e) {}
+            window.filterApps("");
+        } }
+    }
+    Process {
+        id: focusReader; running: true
+        command: ["bash", "-c", "cat ~/.cache/qs_focus_mode 2>/dev/null || echo 'default'"]
+        stdout: StdioCollector { onStreamFinished: {
+            window.focusMode = this.text.trim() || "default";
+            window.filterApps(searchInput.text || "");
+        } }
+    }
+    Process {
+        id: focusWatcher; running: true
+        command: ["bash", "-c", "inotifywait -qq -e modify,close_write ~/.cache/qs_focus_mode 2>/dev/null || sleep 60"]
+        stdout: StdioCollector { onStreamFinished: { focusReader.running = false; focusReader.running = true; focusWatcher.running = false; focusWatcher.running = true; } }
+    }
 
     Process {
         id: appFetcher
@@ -98,6 +182,7 @@ Item {
         let filtered = [];
         
         for (let i = 0; i < allApps.length; i++) {
+            if (!window.appVisibleInMode(allApps[i].exec)) continue;   // focus-mode filter (by command)
             if (allApps[i].name.toLowerCase().includes(q)) {
                 filtered.push(allApps[i]);
             }
@@ -228,6 +313,19 @@ Item {
 
         transform: Translate { y: (window.introPhase - 1) * window.s(60) }
         opacity: window.introPhase
+
+        // Right-click anywhere on the launcher background opens the Useful Tools
+        // popup (calculator + timer/alarm/stopwatch). z:0 keeps it behind the
+        // search field and app list, so it only catches clicks on empty areas.
+        MouseArea {
+            anchors.fill: parent
+            z: 0
+            acceptedButtons: Qt.RightButton
+            onClicked: function(m) {
+                m.accepted = true;
+                Quickshell.execDetached(["bash", Quickshell.env("HOME") + "/.config/hypr/scripts/qs_manager.sh", "open", "tools"]);
+            }
+        }
 
         // --- AMBIENT BLOBS ---
         Rectangle {
@@ -523,6 +621,7 @@ Item {
                             }
 
                             Text {
+                                id: appNameText
                                 Layout.fillWidth: true
                                 text: model.name
                                 font.family: "JetBrains Mono"
@@ -533,7 +632,7 @@ Item {
                                 verticalAlignment: Text.AlignVCenter
                                 
                                 property real textShift: index === appList.currentIndex ? window.s(6) : 0
-                                transform: Translate { x: textShift }
+                                transform: Translate { x: appNameText.textShift }
                                 
                                 Behavior on textShift { 
                                     NumberAnimation { duration: 500; easing.type: Easing.OutExpo } 
@@ -546,9 +645,29 @@ Item {
                             id: ma
                             anchors.fill: parent
                             hoverEnabled: true
-                            onClicked: {
+                            acceptedButtons: Qt.LeftButton | Qt.RightButton
+                            onClicked: function(mouse) {
+                                if (mouse.button === Qt.RightButton) {
+                                    appAssignMenu.cmdKey = window._cmdKey(model.exec);
+                                    appAssignMenu.popup();
+                                    return;
+                                }
                                 appList.currentIndex = index;
                                 launchApp(model.exec);
+                            }
+                        }
+
+                        // Right-click menu: assign to focus modes (drives the TopBar dock).
+                        Menu {
+                            id: appAssignMenu
+                            property string cmdKey: ""
+                            MenuItem {
+                                text: window._inList(window.gamingApps, appAssignMenu.cmdKey) ? "Unassign from Gaming" : "Assign to Gaming (only)"
+                                onTriggered: window.toggleGaming(appAssignMenu.cmdKey)
+                            }
+                            MenuItem {
+                                text: window._inList(window.studyRemoved, appAssignMenu.cmdKey) ? "Restore to Study" : "Remove from Study"
+                                onTriggered: window.toggleStudyRemoved(appAssignMenu.cmdKey)
                             }
                         }
                     }
