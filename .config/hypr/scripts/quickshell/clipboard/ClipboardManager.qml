@@ -17,9 +17,12 @@ Item {
         id: scaler
         currentWidth: Screen.width
     }
-    
-    function s(val) { 
-        return scaler.s(val); 
+
+    // Same magnification reduction as the launcher: content was sized for the old
+    // 800×700 window, now shrunk by 560/800 = 0.7 to fit the 560×440 window cleanly.
+    property real uiMag: 0.7
+    function s(val) {
+        return scaler.s(val) * window.uiMag;
     }
 
     MatugenColors { id: _theme }
@@ -625,6 +628,7 @@ Item {
                         clip: true
 
                         Text {
+                            id: clipItemText
                             anchors.fill: parent
                             text: model.content
                             font.family: "JetBrains Mono"
@@ -637,7 +641,7 @@ Item {
                             maximumLineCount: 4 
                             
                             property real textShift: index === clipList.currentIndex ? window.s(4) : 0
-                            transform: Translate { x: textShift }
+                            transform: Translate { x: clipItemText.textShift }
                             Behavior on textShift { NumberAnimation { duration: 500; easing.type: Easing.OutExpo } }
                             Behavior on color { ColorAnimation { duration: 300; easing.type: Easing.OutExpo } }
                         }
