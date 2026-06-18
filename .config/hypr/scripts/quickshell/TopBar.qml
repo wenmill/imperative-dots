@@ -603,6 +603,51 @@ Variants {
                 }
             }
 
+            // ── Dock assignment state (shared with the app launcher) ──
+            // The launcher writes ~/.cache/qs_dock_state.json when you right-click an app
+            // and assign it. We read gaming[] / studyRemoved[] here and match by `cmd` so
+            // those assignments drive which dock icons show per focus mode — same rules:
+            //   gaming-assigned → hidden in default & study (gaming only)
+            //   study-removed   → hidden in study
+            property var dockGaming: []
+            property var dockStudyRemoved: []
+            Process {
+                id: dockStateReader; running: true
+                command: ["bash", "-c", "cat ~/.cache/qs_dock_state.json 2>/dev/null || echo '{}'"]
+                stdout: StdioCollector {
+                    onStreamFinished: {
+                        try {
+                            let d = JSON.parse(this.text);
+                            barWindow.dockGaming = d.gaming || [];
+                            barWindow.dockStudyRemoved = d.studyRemoved || [];
+                        } catch(e) {}
+                    }
+                }
+            }
+            Process {
+                id: dockStateWatcher; running: true
+                command: ["bash", "-c", "inotifywait -qq -e modify,close_write ~/.cache/qs_dock_state.json 2>/dev/null || sleep 60"]
+                onExited: {
+                    dockStateReader.running = false; dockStateReader.running = true;
+                    running = false; running = true;
+                }
+            }
+            // True if this dock app (matched by cmd) is hidden in the current focus mode,
+            // combining its static hideIn with the launcher's saved assignments.
+            function dockAppHidden(modelData) {
+                let cmd = modelData.cmd;
+                // Static hideIn still applies.
+                if (modelData.hideIn && modelData.hideIn.indexOf(barWindow.focusMode) >= 0) return true;
+                // Gaming-assigned (from launcher): show only in gaming.
+                for (let i = 0; i < barWindow.dockGaming.length; i++)
+                    if (barWindow.dockGaming[i] === cmd && barWindow.focusMode !== "gaming") return true;
+                // Study-removed (from launcher): hide in study.
+                if (barWindow.focusMode === "study")
+                    for (let j = 0; j < barWindow.dockStudyRemoved.length; j++)
+                        if (barWindow.dockStudyRemoved[j] === cmd) return true;
+                return false;
+            }
+
             // ── Focus end epoch reader ──
             Process {
                 id: focusEndReader; running: true
@@ -761,7 +806,7 @@ Variants {
             // ─────────────────────────────────────────────
             // WORKSPACES
             // ─────────────────────────────────────────────
-            Process { id: wsDaemon; command: ["bash", "-c", "~/.config/hypr/scripts/quickshell/workspaces.sh"]; running: true }
+            Process { id: wsDaemon; command: ["bash", "-c", "~/.config/hypr/scripts/workspaces.sh"]; running: true }
             Process {
                 id: wsReader
                 command: ["cat", "/tmp/qs_workspaces.json"]
@@ -1015,16 +1060,23 @@ Variants {
                             border.color: Qt.rgba(mocha.mauve.r, mocha.mauve.g, mocha.mauve.b, aiBtn.glowOpacity)
                         }
                         Text {
-                            anchors.centerIn: parent; text: "󰂽"
+                            anchors.centerIn: parent; text: "󰣇"
                             font.family: "Iosevka Nerd Font"; font.pixelSize: barWindow.s(26)
                             color: aiBtn.isHovered ? mocha.mauve : mocha.subtext0
                             Behavior on color { ColorAnimation { duration: 200 } }
                         }
                         MouseArea {
                             id: aiMouse; anchors.fill: parent; hoverEnabled: true
+                            acceptedButtons: Qt.LeftButton | Qt.MiddleButton | Qt.RightButton
                             onClicked: function(mouse) {
                                 mouse.accepted = true;
-                                Quickshell.execDetached(["bash", "-c", "~/.config/hypr/scripts/qs_manager.sh toggle ai"]);
+                                if (mouse.button === Qt.MiddleButton) {
+                                    Quickshell.execDetached(["bash", "-c", "~/.config/hypr/scripts/qs_manager.sh toggle clipboard"]);
+                                } else if (mouse.button === Qt.RightButton) {
+                                    Quickshell.execDetached(["bash", "-c", "~/.config/hypr/scripts/qs_manager.sh toggle tools"]);
+                                } else {
+                                    Quickshell.execDetached(["bash", "-c", "~/.config/hypr/scripts/qs_manager.sh toggle applauncher"]);
+                                }
                             }
                         }
                     }
@@ -1070,8 +1122,9 @@ Variants {
                                 model: dockBox.dockApps
                                 delegate: Item {
                                     id: dockItemWrapper
-                                    // Hide gaming apps when not in gaming mode
-                                    property bool isHidden: modelData.hideIn.indexOf(barWindow.focusMode) >= 0
+                                    // Hidden if its static hideIn OR a launcher assignment
+                                    // (gaming-only / study-removed) hides it in this mode.
+                                    property bool isHidden: barWindow.dockAppHidden(modelData)
                                     visible: !isHidden
                                     width: visible ? barWindow.s(36) : 0
                                     height: visible ? barWindow.s(40) : 0
@@ -1326,16 +1379,16 @@ Variants {
                     RowLayout {
                         id: centerLayout; anchors.centerIn: parent; spacing: barWindow.s(16)
 
-                        // Search
+                        // Matrix chat (moved to the left side of the center section)
                         Rectangle {
-                            id: searchBtn; property bool isHovered: searchMouse.containsMouse
+                            id: matrixBtn; property bool isHovered: matrixMouse.containsMouse
                             color: isHovered ? Qt.rgba(mocha.surface1.r, mocha.surface1.g, mocha.surface1.b, 0.6) : "transparent"
                             radius: barWindow.s(10)
                             Layout.preferredWidth: barWindow.s(32); Layout.preferredHeight: barWindow.s(32)
                             Behavior on color { ColorAnimation { duration: 200 } }
                             scale: isHovered ? 1.1 : 1.0; Behavior on scale { NumberAnimation { duration: 250; easing.type: Easing.OutExpo } }
-                            Text { anchors.centerIn: parent; text: "󰣇"; font.family: "Iosevka Nerd Font"; font.pixelSize: barWindow.s(22); color: searchBtn.isHovered ? mocha.blue : mocha.subtext0; Behavior on color { ColorAnimation { duration: 200 } } }
-                            MouseArea { id: searchMouse; anchors.fill: parent; hoverEnabled: true; onClicked: function(m) { m.accepted = true; Quickshell.execDetached(["bash", "-c", "~/.config/hypr/scripts/qs_manager.sh toggle appmenu"]); } }
+                            Text { anchors.centerIn: parent; text: "󰸿"; font.family: "Iosevka Nerd Font"; font.pixelSize: barWindow.s(20); color: matrixBtn.isHovered ? mocha.mauve : mocha.subtext0; Behavior on color { ColorAnimation { duration: 200 } } }
+                            MouseArea { id: matrixMouse; anchors.fill: parent; hoverEnabled: true; onClicked: function(m) { m.accepted = true; Quickshell.execDetached(["bash", "-c", "~/.config/hypr/scripts/qs_manager.sh toggle matrix"]); } }
                         }
 
                         // Clock
@@ -1372,8 +1425,8 @@ Variants {
                             Layout.preferredWidth: barWindow.s(32); Layout.preferredHeight: barWindow.s(32)
                             Behavior on color { ColorAnimation { duration: 200 } }
                             scale: isHovered ? 1.1 : 1.0; Behavior on scale { NumberAnimation { duration: 250; easing.type: Easing.OutExpo } }
-                            Text { anchors.centerIn: parent; text: "󰅎"; font.family: "Iosevka Nerd Font"; font.pixelSize: barWindow.s(20); color: clipBtn.isHovered ? mocha.green : mocha.subtext0; Behavior on color { ColorAnimation { duration: 200 } } }
-                            MouseArea { id: clipMouse; anchors.fill: parent; hoverEnabled: true; onClicked: function(m) { m.accepted = true; Quickshell.execDetached(["bash", "-c", "~/.config/hypr/scripts/qs_manager.sh toggle clipboard"]); } }
+                            Text { anchors.centerIn: parent; text: "󱌾"; font.family: "Iosevka Nerd Font"; font.pixelSize: barWindow.s(20); color: clipBtn.isHovered ? mocha.green : mocha.subtext0; Behavior on color { ColorAnimation { duration: 200 } } }
+                            MouseArea { id: clipMouse; anchors.fill: parent; hoverEnabled: true; onClicked: function(m) { m.accepted = true; Quickshell.execDetached(["bash", "-c", "~/.config/hypr/scripts/qs_manager.sh toggle library"]); } }
                         }
                     }
                 }
@@ -1567,7 +1620,24 @@ Variants {
                                     Text { anchors.verticalCenter: parent.verticalCenter; text: "󰌌"; font.family: "Iosevka Nerd Font"; font.pixelSize: barWindow.s(16); color: kbPill.isHovered ? mocha.text : mocha.overlay2 }
                                     Text { anchors.verticalCenter: parent.verticalCenter; text: barWindow.kbLayout; font.family: "JetBrains Mono"; font.pixelSize: barWindow.s(13); font.weight: Font.Black; color: mocha.text }
                                 }
-                                MouseArea { id: kbMouse; anchors.fill: parent; hoverEnabled: true; onClicked: Quickshell.execDetached(["hyprctl", "switchxkblayout", "main", "next"]) }
+                                MouseArea {
+                                    id: kbMouse; anchors.fill: parent; hoverEnabled: true
+                                    acceptedButtons: Qt.LeftButton | Qt.RightButton
+                                    onClicked: function(mouse) {
+                                        if (mouse.button === Qt.RightButton) {
+                                            // Right-click: set the SYSTEM keyboard layout/locale to the
+                                            // current typing layout (persists via localectl). Needs polkit/sudo
+                                            // rights for localectl; runs through pkexec so the user is prompted.
+                                            Quickshell.execDetached(["bash", "-c",
+                                                "L=$(hyprctl devices -j | jq -r '.keyboards[] | select(.main==true) | .active_keymap' 2>/dev/null); " +
+                                                "CODE=$(echo \"$L\" | grep -qi english && echo us || (hyprctl getoption input:kb_layout -j | jq -r '.str' | cut -d, -f1)); " +
+                                                "pkexec localectl set-x11-keymap \"$CODE\" 2>/dev/null || localectl set-x11-keymap \"$CODE\" 2>/dev/null"]);
+                                        } else {
+                                            // Left-click: cycle the typing layout only (no system change).
+                                            Quickshell.execDetached(["hyprctl", "switchxkblayout", "main", "next"]);
+                                        }
+                                    }
+                                }
                             }
 
                             // WiFi / Ethernet

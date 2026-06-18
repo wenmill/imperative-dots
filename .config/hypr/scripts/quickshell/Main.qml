@@ -15,6 +15,37 @@ PanelWindow {
 
     Caching { id: paths }
 
+    // ── Always-on Hermes setup ────────────────────────────────────────────────
+    // Runs once at shell startup so the Hermes environment is ALWAYS ready before
+    // any prompt is sent — the state dirs exist, the session file is initialized,
+    // and a warmup checks the agent is reachable. Without this, a prompt sent
+    // before lazy init could go nowhere.
+    Process {
+        id: hermesInit
+        running: true
+        command: ["bash", "-c",
+            "export PATH=\"$HOME/.local/bin:$HOME/bin:$HOME/.hermes/venv/bin:$HOME/.cargo/bin:$PATH\"; " +
+            // Ensure state dirs exist (used by hermes_bridge.sh + FloatingContent).
+            "mkdir -p \"$HOME/.cache/qs_ai_state\" \"$HOME/.cache/qs_matrix\"; " +
+            // Seed an empty session pointer if missing so the first turn has context.
+            "[ -f \"$HOME/.cache/qs_ai_state/hermes_session.txt\" ] || : > \"$HOME/.cache/qs_ai_state/hermes_session.txt\"; " +
+            // Warm up hermes (loads venv/model paths) so the first real prompt isn't
+            // delayed or dropped. Non-fatal if hermes isn't installed yet.
+            "command -v hermes >/dev/null 2>&1 && hermes --version >/dev/null 2>&1 || true"
+        ]
+    }
+
+    // Periodic keep-alive: re-ensure the state dir exists (e.g. if /tmp-like cleanup
+    // or a cache wipe removed it) so we never silently lose the path a prompt needs.
+    Timer {
+        interval: 60000; running: true; repeat: true
+        onTriggered: hermesKeepAlive.running = true
+    }
+    Process {
+        id: hermesKeepAlive
+        command: ["bash", "-c", "mkdir -p \"$HOME/.cache/qs_ai_state\""]
+    }
+
     IpcHandler {
         target: "main"
 

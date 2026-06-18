@@ -1,6 +1,7 @@
 //@ pragma UseQApplication
 import QtQuick
 import Quickshell
+import "floating" as FloatingDir
 
 ShellRoot {
     Connections {
@@ -11,6 +12,6 @@ ShellRoot {
 
     Main {}
     TopBar {}
-    Floating {}
+    FloatingDir.Floating {}
 }
 

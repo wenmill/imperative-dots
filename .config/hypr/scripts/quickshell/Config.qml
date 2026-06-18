@@ -84,11 +84,57 @@ Item {
     property real uiScale: 1.0
     property bool openGuideAtStartup: true
     property bool topbarHelpIcon: true
+    // User-set height (in px) for the bottom floating module. 0 = auto-fill (default).
+    // Persisted via setSetting("floatingBottomHeight", ...) when the user drags to resize.
+    property real floatingBottomHeight: 0
     property int workspaceCount: 8
     property int initialWorkspaceCount: 8
     property string wallpaperDir: Quickshell.env("WALLPAPER_DIR") || (homeDir + "/Pictures/Wallpapers")
     property string language: ""
     property string kbOptions: "grp:alt_shift_toggle"
+
+    // --- Correspondence chess (persisted across restarts) ---------------------
+    // The distractions chess module mirrors an ongoing Lichess correspondence game
+    // on its start-page mini-board. We persist enough to restore it instantly on
+    // launch (id/color/turn/fen) and an auto-refresh interval that drives how often
+    // the module re-polls Lichess for the opponent's latest move.
+    property string corrChessGameId: ""        // active correspondence game id ("" = none)
+    property bool   corrChessIsWhite: true      // which color we are in it
+    property bool   corrChessMyTurn: true       // whose move it is
+    property string corrChessFen: ""            // last known board FEN
+    property int    corrChessRefreshMs: 8000    // mini-board auto-refresh interval (ms)
+    // Persist the whole corr-chess snapshot in one write.
+    function saveCorrChess(gameId, isWhite, myTurn, fen) {
+        corrChessGameId = gameId || "";
+        corrChessIsWhite = isWhite !== false;
+        corrChessMyTurn  = myTurn === true;
+        corrChessFen     = fen || "";
+        updateJsonBulk({
+            corrChessGameId: corrChessGameId,
+            corrChessIsWhite: corrChessIsWhite,
+            corrChessMyTurn: corrChessMyTurn,
+            corrChessFen: corrChessFen
+        });
+    }
+    function clearCorrChess() { saveCorrChess("", true, true, ""); }
+
+    // --- Kavita audiobook resume (persisted) ----------------------------------
+    // Remembers the last audiobook chapter + position so playback resumes where
+    // you left off, even across restarts. Written by the distractions audio UI.
+    property int    audioBookChapterId: 0     // last-played chapter id (0 = none)
+    property real   audioBookPosMs: 0         // position within that chapter (ms)
+    property string audioBookTitle: ""        // for display on resume
+    function saveAudioBookPos(chapterId, posMs, title) {
+        audioBookChapterId = chapterId || 0;
+        audioBookPosMs = posMs || 0;
+        if (title !== undefined) audioBookTitle = title;
+        updateJsonBulk({
+            audioBookChapterId: audioBookChapterId,
+            audioBookPosMs: Math.round(audioBookPosMs),
+            audioBookTitle: audioBookTitle
+        });
+    }
+
 
     property string weatherUnit: "metric"
     property string weatherApiKey: ""
@@ -331,6 +377,7 @@ Item {
     Component.onCompleted: {
         settingsReader.running = true;
         envReader.running = true;
+        hermesLoad();
     }
 
     Process {
@@ -371,9 +418,18 @@ Item {
                         if (config.rawSettings.uiScale !== undefined) config.uiScale = config.rawSettings.uiScale;
                         if (config.rawSettings.openGuideAtStartup !== undefined) config.openGuideAtStartup = config.rawSettings.openGuideAtStartup;
                         if (config.rawSettings.topbarHelpIcon !== undefined) config.topbarHelpIcon = config.rawSettings.topbarHelpIcon;
+                        if (config.rawSettings.floatingBottomHeight !== undefined) config.floatingBottomHeight = config.rawSettings.floatingBottomHeight;
                         if (config.rawSettings.wallpaperDir !== undefined) config.wallpaperDir = config.rawSettings.wallpaperDir;
                         if (config.rawSettings.language !== undefined && config.rawSettings.language !== "") config.language = config.rawSettings.language;
                         if (config.rawSettings.kbOptions !== undefined) config.kbOptions = config.rawSettings.kbOptions;
+                        if (config.rawSettings.corrChessGameId !== undefined) config.corrChessGameId = config.rawSettings.corrChessGameId;
+                        if (config.rawSettings.corrChessIsWhite !== undefined) config.corrChessIsWhite = config.rawSettings.corrChessIsWhite;
+                        if (config.rawSettings.corrChessMyTurn !== undefined) config.corrChessMyTurn = config.rawSettings.corrChessMyTurn;
+                        if (config.rawSettings.corrChessFen !== undefined) config.corrChessFen = config.rawSettings.corrChessFen;
+                        if (config.rawSettings.corrChessRefreshMs !== undefined) config.corrChessRefreshMs = config.rawSettings.corrChessRefreshMs;
+                        if (config.rawSettings.audioBookChapterId !== undefined) config.audioBookChapterId = config.rawSettings.audioBookChapterId;
+                        if (config.rawSettings.audioBookPosMs !== undefined) config.audioBookPosMs = config.rawSettings.audioBookPosMs;
+                        if (config.rawSettings.audioBookTitle !== undefined) config.audioBookTitle = config.rawSettings.audioBookTitle;
                         if (config.rawSettings.workspaceCount !== undefined) {
                             config.workspaceCount = config.rawSettings.workspaceCount;
                             config.initialWorkspaceCount = config.rawSettings.workspaceCount; 
@@ -423,5 +479,113 @@ Item {
                 config.dataReady = true;
             }
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  HERMES CONVERSATION PERSISTENCE
+    //  Owns the agent's single continuous conversation (the OpenAI /v1/chat
+    //  endpoint is stateless, so we keep the message history here) plus the
+    //  session id and the 4am / new-chat rotation. FloatingContent reads/writes
+    //  through these — the persistence lives at this shared top layer, not in a
+    //  bridge script.
+    // ════════════════════════════════════════════════════════════════════════
+    readonly property string hermesConvoPath: cacheDir + "/qs_ai_state/hermes_convo.json"
+    readonly property string hermesSessionPath: cacheDir + "/qs_ai_state/hermes_session.txt"
+
+    // In-memory conversation: array of {role, content, tool_call_id?, tool_calls?}.
+    property var hermesConvo: []
+    property string hermesSessionId: ""
+    // The /v1/responses chaining id — links each turn to the ongoing server-side
+    // conversation. Empty = next message starts a fresh thread.
+    property string hermesResponseId: ""
+    property double hermesCreatedEpoch: 0
+    property bool hermesLoaded: false
+
+    // (No explicit hermesConvoChanged signal — the hermesConvo property auto-generates
+    //  its own change signal, which fires whenever we reassign it below.)
+
+    // Most recent 4am boundary (local), as epoch seconds.
+    function _last4amEpoch() {
+        let now = new Date();
+        let four = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 4, 0, 0, 0);
+        if (now.getTime() < four.getTime()) four.setDate(four.getDate() - 1);
+        return Math.floor(four.getTime() / 1000);
+    }
+
+    // Load persisted conversation from disk into memory (called once at startup).
+    function hermesLoad() {
+        hermesConvoReader.running = false;
+        hermesConvoReader.running = true;
+    }
+    property var hermesConvoReader: Process {
+        command: ["bash", "-c",
+            "mkdir -p \"" + config.cacheDir + "/qs_ai_state\"; " +
+            "cat \"" + config.hermesConvoPath + "\" 2>/dev/null || echo '[]'; " +
+            "echo '---SEP---'; " +
+            "cat \"" + config.hermesSessionPath + "\" 2>/dev/null || echo ''"]
+        stdout: StdioCollector {
+            onStreamFinished: {
+                let parts = this.text.split("---SEP---");
+                try { config.hermesConvo = JSON.parse((parts[0] || "[]").trim() || "[]"); }
+                catch(e) { config.hermesConvo = []; }
+                // Safety: an old session file may hold a huge history that overflows the
+                // model context. Trim to the recent tail on load.
+                if (config.hermesConvo.length > 8)
+                    config.hermesConvo = config.hermesConvo.slice(config.hermesConvo.length - 8);
+                let sess = (parts[1] || "").trim().split("\n");
+                config.hermesSessionId = (sess[0] || "").trim();
+                config.hermesCreatedEpoch = parseInt((sess[1] || "0").trim()) || 0;
+                config.hermesResponseId = (sess[2] || "").trim();
+                config.hermesLoaded = true;
+                config.hermesRotateIfNeeded();
+            }
+        }
+    }
+
+    // Persist the in-memory conversation + session pointer to disk.
+    function hermesSave() {
+        let convoStr = JSON.stringify(config.hermesConvo).replace(/'/g, "'\\''");
+        let cmd = "mkdir -p \"" + config.cacheDir + "/qs_ai_state\" && " +
+                  "printf '%s' '" + convoStr + "' > \"" + config.hermesConvoPath + "\" && " +
+                  "printf '%s\\n%s\\n%s\\n' '" + config.hermesSessionId + "' '" + config.hermesCreatedEpoch + "' '" + config.hermesResponseId + "' > \"" + config.hermesSessionPath + "\"";
+        sh(cmd);
+    }
+
+    // Record the latest /v1/responses id (for chaining the next turn) and persist it.
+    function hermesSetResponseId(id) {
+        config.hermesResponseId = id || "";
+        config.hermesSave();
+    }
+
+    // Start a brand-new session (new chat): clear convo + response chain + new id/timestamp.
+    function hermesNewSession() {
+        config.hermesConvo = [];
+        config.hermesResponseId = "";          // fresh /v1/responses thread
+        config.hermesSessionId = "qspopup-" + Math.floor(Date.now() / 1000);
+        config.hermesCreatedEpoch = Math.floor(Date.now() / 1000);
+        config.hermesSave();
+    }
+
+    // Rotate if there's no session, or the session predates the last 4am boundary.
+    function hermesRotateIfNeeded() {
+        if (!config.hermesSessionId || config.hermesSessionId === "ROTATE"
+            || config.hermesCreatedEpoch < config._last4amEpoch()) {
+            config.hermesNewSession();
+            return true;
+        }
+        return false;
+    }
+
+    // Append a message to the conversation and persist. Caps history at ~40.
+    function hermesAppend(msg) {
+        let c = config.hermesConvo.slice();
+        c.push(msg);
+        // The Hermes agent server injects its own large context (system prompt, tools,
+        // memory ~16k tokens) and enforces --max-model-len. Sending a long client-side
+        // history on top overflows the window and the request fails. Keep only a short
+        // recent tail so we stay within budget; the server handles longer-term memory.
+        if (c.length > 8) c = c.slice(c.length - 8);
+        config.hermesConvo = c;
+        config.hermesSave();
     }
 }

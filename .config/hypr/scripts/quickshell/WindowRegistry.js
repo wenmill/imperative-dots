@@ -36,11 +36,14 @@ function getLayout(name, mx, my, mw, mh, userScale) {
         "network":   { w: s(900, scale), h: s(700, scale), rx: mw - s(904, scale), ry: s(60, scale), comp: "network/NetworkPopup.qml" },
         "volume":    { w: s(450, scale), h: s(700, scale), rx: mw - s(455, scale), ry: s(60, scale), comp: "volume/VolumePopup.qml" },
         "ai":        { w: s(801, scale), h: s(1000, scale), rx: s(12, scale), ry: s(60, scale), comp: "AiPopup.qml" },
+        "library":   { w: s(801, scale), h: s(1000, scale), rx: Math.floor((mw/2)-(s(801, scale)/2)), ry: Math.floor((mh/2)-(s(1000, scale)/2)), comp: "distractions/Distraction.qml" },
+        "matrix":    { w: s(801, scale), h: s(1000, scale), rx: Math.floor((mw/2)-(s(801, scale)/2)), ry: Math.floor((mh/2)-(s(1000, scale)/2)), comp: "matrix/Matrix_Popup.qml" },
         "music":     { w: s(700, scale), h: s(650, scale), rx: s(5, scale), ry: s(60, scale), comp: "music/MusicPopup.qml" },
         
         // --- Central Standard Tools ---
-        "applauncher": { w: s(800, scale), h: s(700, scale), rx: Math.floor((mw/2)-(s(800, scale)/2)), ry: Math.floor((mh/2)-(s(700, scale)/2)), comp: "applauncher/appLauncher.qml" },
-        "clipboard":   { w: s(800, scale), h: s(700, scale), rx: Math.floor((mw/2)-(s(800, scale)/2)), ry: Math.floor((mh/2)-(s(700, scale)/2)), comp: "clipboard/ClipboardManager.qml" },
+        "applauncher": { w: s(560, scale), h: s(440, scale), rx: s(12, scale), ry: s(60, scale), comp: "applauncher/appLauncher.qml" },
+        "tools":       { w: s(560, scale), h: s(440, scale), rx: s(12, scale), ry: s(60, scale), comp: "tools/Useful_Tools.qml" },
+        "clipboard":   { w: s(560, scale), h: s(440, scale), rx: s(12, scale), ry: s(60, scale), comp: "clipboard/ClipboardManager.qml" },
         "stewart":     { w: s(800, scale), h: s(650, scale), rx: Math.floor((mw/2)-(s(800, scale)/2)), ry: Math.floor((mh/2)-(s(650, scale)/2)), comp: "stewart/stewart.ml" },
         "focuswarn":   { w: s(340, scale), h: s(180, scale), rx: Math.floor((mw/2)-(s(340, scale)/2)), ry: Math.floor((mh/2)-(s(180, scale)/2)), comp: "FocusWarning.qml" },
 
