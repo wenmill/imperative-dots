@@ -9,7 +9,6 @@
 #   - Added: Ollama (GPU-aware: cuda / cpu variant auto-selected on non-AMD)
 #   - Added: vLLM-TurboQuant container (replaces Ollama on AMD ROCm systems)
 #   - Added: Hermes Agent (points directly at Ollama), Kavita reading server
-#   - Removed: LiteLLM (no longer in the stack — Hermes talks to Ollama directly)
 #   - Added: SDDM Astronaut theme (replaces upstream's matugen-minimal SDDM theme)
 #   - Added: AI popup config template
 #   - Added packages: quickshell-git, hyprpolkitagent, uwsm, rust, python-pip,
@@ -164,9 +163,13 @@ ARCH_PKGS=(
     "kitty" "cava" "zbar" "pavucontrol" "alsa-utils" "awww" "networkmanager-dmenu-git"
     "wl-clipboard" "fd" "qt6-multimedia" "qt6-5compat" "ripgrep"
     "cliphist" "jq" "socat" "inotify-tools" "pamixer" "brightnessctl" "acpi" "iw"
-    "bluez" "bluez-utils" "libnotify" "networkmanager" "lm_sensors" "bc"
+    "bluez" "bluez-utils" "libnotify" "networkmanager" "nm-connection-editor" "lm_sensors" "bc"
+    # System-maintenance "update" button in the battery popup:
+    #   pacman-contrib → checkupdates (safe update preview) + paccache (cache clean)
+    #   arch-audit     → CVE/vulnerability check
+    "pacman-contrib" "arch-audit"
     "pipewire" "wireplumber" "pipewire-pulse" "pipewire-alsa" "pipewire-jack" "libpulse" "python"
-    "imagemagick" "file" "git" "psmisc"
+    "imagemagick" "file" "git" "psmisc" "mpv" "mpv-mpris"
     "matugen-bin" "ffmpeg" "fastfetch" "quickshell-git" "unzip" "python-websockets" "qt6-websockets"
     "grim" "playerctl" "satty" "yq" "xdg-desktop-portal-gtk" "xdg-desktop-portal-wlr" "slurp" "mpvpaper"
     "wmctrl" "power-profiles-daemon" "easyeffects" "swayosd-git" "nautilus" "lsp-plugins"
@@ -626,7 +629,7 @@ show_overview() {
     print_kb "SUPER + A" "Toggle AI popup"
     echo ""
     echo -e "${BOLD}${C_BLUE}--- AI / Ollama / Hermes ---${RESET}"
-    print_kb "ai_config.json" "API key, model, lichess + kavita keys"
+    print_kb "config.json" "API key, model, lichess + kavita keys"
     if [ "$USE_VLLM_TURBOQUANT" = true ]; then
         print_kb "vLLM-TurboQuant" "http://localhost:8000 (AMD ROCm container)"
     else
@@ -634,6 +637,8 @@ show_overview() {
     fi
     print_kb "SearXNG" "http://localhost:8888 (private metasearch, JSON)"
     print_kb "autobrowse" "http://localhost:8080 (Camoufox stealth MCP)"
+    print_kb "screenpipe" "http://localhost:3030 (24/7 screen history API)"
+    print_kb "Honcho" "http://localhost:8000 (Hermes cross-session memory)"
     print_kb "Hermes" "Approval-based shell tool execution"
     print_kb "Kavita" "http://localhost:5000 (reading server)"
     echo ""
@@ -703,6 +708,8 @@ manage_ai_stack() {
         fi
         echo -e "  ${C_GREEN}SearXNG${RESET}    — private metasearch, JSON-only (port 8888)"
         echo -e "  ${C_GREEN}autobrowse${RESET} — Camoufox stealth browser MCP (port 8080)"
+        echo -e "  ${C_GREEN}screenpipe${RESET} — 24/7 local screen history, REST API (port 3030)"
+        echo -e "  ${C_GREEN}Honcho${RESET}     — cross-session memory for Hermes (port 8000)"
         echo -e "  ${C_GREEN}Hermes${RESET}     — agent that uses Ollama for tool calls"
         echo -e "  ${C_GREEN}Kavita${RESET}     — reading server (port 5000)\n"
 
@@ -1418,7 +1425,7 @@ if [ "$OPT_AI" = true ]; then
     # via the quadlet's Environment= directive.
     cat > "$SEARXNG_CFG_DIR/settings.yml" <<'YAMLEOF'
 # SearXNG settings for the AI-facing instance.
-# - JSON output only (LiteLLM/Hermes parse this)
+# - JSON output only (Hermes parses this)
 # - Rate limiter disabled (your VPN handles IP rotation/anonymity)
 # - Only engines we actually want the AI to query
 use_default_settings: true
@@ -1625,15 +1632,178 @@ EOF
 fi
 
 # ==============================================================================
+# screenpipe (mediar-ai) — 24/7 local screen + audio history for Hermes
+#
+# screenpipe captures the screen (X11/PipeWire) so it must run as a HOST process,
+# not a container (a container can't reach the host's display server cleanly).
+# It exposes a local REST API on :3030 and an MCP server (npx screenpipe-mcp).
+# Data lives in ~/.screenpipe. Installed via upstream curl|sh; run as a --user
+# systemd service so it records continuously and Hermes can query it.
+# ==============================================================================
+if [ "$OPT_AI" = true ]; then
+    echo -e "\n${C_CYAN}[ INFO ]${RESET} Setting up screenpipe (24/7 screen history for Hermes)..."
+
+    if [ "$HEADLESS" = "true" ]; then
+        printf "  -> screenpipe (skipped in headless mode) %-6s ${C_BLUE}[SKIP]${RESET}\n" ""
+    else
+        # screenpipe needs ffmpeg + tesseract for capture/OCR on Linux.
+        if command -v pacman &>/dev/null; then
+            sudo pacman -S --needed --noconfirm ffmpeg tesseract tesseract-data-eng >/dev/null 2>&1 \
+                && printf "  -> screenpipe deps (ffmpeg, tesseract) %-7s ${C_GREEN}[ OK ]${RESET}\n" "" \
+                || printf "  -> screenpipe deps install issue %-13s ${C_YELLOW}[WARN]${RESET}\n" ""
+        fi
+
+        if command -v screenpipe &>/dev/null; then
+            printf "  -> screenpipe already installed %-15s ${C_GREEN}[ OK ]${RESET}\n" ""
+        else
+            echo -e "  -> ${C_YELLOW}screenpipe is third-party (mediar-ai, MIT).${RESET}"
+            echo -e "  -> ${DIM}Installer: https://docs.screenpi.pe (curl | sh)${RESET}"
+            read -rp "  Install screenpipe now? [y/N] " yn
+            if [[ "$yn" =~ ^[Yy]$ ]]; then
+                if curl -fsSL https://get.screenpi.pe/cli | sh >/dev/null 2>&1 \
+                   || curl -fsSL https://raw.githubusercontent.com/mediar-ai/screenpipe/main/install.sh | sh >/dev/null 2>&1; then
+                    printf "  -> screenpipe installed %-23s ${C_GREEN}[ OK ]${RESET}\n" ""
+                else
+                    printf "  -> screenpipe install failed %-18s ${C_YELLOW}[WARN]${RESET}\n" ""
+                    echo -e "  -> ${DIM}Manual: see https://docs.screenpi.pe/getting-started${RESET}"
+                fi
+            else
+                echo "  -> Skipped screenpipe install"
+            fi
+        fi
+
+        # Run screenpipe as a --user service so it records continuously.
+        if command -v screenpipe &>/dev/null; then
+            SP_UNIT_DIR="$HOME/.config/systemd/user"
+            mkdir -p "$SP_UNIT_DIR"
+            cat > "$SP_UNIT_DIR/screenpipe.service" <<EOF
+[Unit]
+Description=screenpipe (24/7 local screen + audio capture, REST API on :3030)
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=$(command -v screenpipe) --port 3030
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+            chmod 644 "$SP_UNIT_DIR/screenpipe.service"
+            systemctl --user daemon-reload
+            if systemctl --user enable --now screenpipe.service 2>/dev/null; then
+                printf "  -> screenpipe.service enabled %-17s ${C_GREEN}[ OK ]${RESET}\n" ""
+            else
+                printf "  -> screenpipe.service failed %-18s ${C_YELLOW}[WARN]${RESET}\n" ""
+                printf "  -> ${DIM}Check: journalctl --user -xeu screenpipe${RESET}\n"
+            fi
+            echo "  -> ${C_CYAN}REST API:${RESET}     http://localhost:3030/"
+            echo "  -> ${C_CYAN}MCP server:${RESET}   npx -y screenpipe-mcp  (for Hermes wiring)"
+            echo "  -> ${C_CYAN}Data dir:${RESET}     ~/.screenpipe/"
+        fi
+    fi
+fi
+
+# ==============================================================================
+# Honcho (plastic-labs) — cross-session memory layer for Hermes
+#
+# Honcho is Hermes' long-term/cross-session memory backend. Self-hosted, it runs
+# the API (:8000) + PostgreSQL(pgvector) + Redis via Docker Compose, built from
+# source (no prebuilt image on Docker Hub). The elkimek/honcho-self-hosted repo
+# wires it to Hermes out of the box. We clone upstream Honcho into ~/honcho and
+# bring the stack up; the Hermes config already points its memory layer here.
+# ==============================================================================
+if [ "$OPT_AI" = true ]; then
+    echo -e "\n${C_CYAN}[ INFO ]${RESET} Setting up Honcho (cross-session memory for Hermes)..."
+
+    HONCHO_DIR="$HOME/honcho"
+    HONCHO_REPO="https://github.com/plastic-labs/honcho.git"
+
+    # Honcho's compose builds from source -> needs a working container engine with
+    # build support. Prefer docker compose; fall back to podman-compose.
+    HONCHO_COMPOSE=""
+    if command -v docker &>/dev/null && docker compose version &>/dev/null; then
+        HONCHO_COMPOSE="docker compose"
+    elif command -v podman-compose &>/dev/null; then
+        HONCHO_COMPOSE="podman-compose"
+    fi
+
+    if [ "$HEADLESS" = "true" ]; then
+        printf "  -> Honcho (skipped in headless mode) %-10s ${C_BLUE}[SKIP]${RESET}\n" ""
+    elif [ -z "$HONCHO_COMPOSE" ]; then
+        printf "  -> Honcho needs docker/podman compose %-8s ${C_YELLOW}[WARN]${RESET}\n" ""
+        echo -e "  -> ${DIM}Install docker + docker-compose (or podman-compose) then re-run.${RESET}"
+    else
+        echo -e "  -> ${C_YELLOW}Honcho is third-party (plastic-labs, AGPL-3.0).${RESET}"
+        echo -e "  -> ${DIM}Repo: $HONCHO_REPO  (builds from source: Postgres+pgvector, Redis, API:8000)${RESET}"
+        read -rp "  Install & start Honcho now? [y/N] " yn
+        if [[ "$yn" =~ ^[Yy]$ ]]; then
+            if [ ! -d "$HONCHO_DIR/.git" ]; then
+                if git clone --depth 1 "$HONCHO_REPO" "$HONCHO_DIR" >/dev/null 2>&1; then
+                    printf "  -> Honcho cloned to ~/honcho %-18s ${C_GREEN}[ OK ]${RESET}\n" ""
+                else
+                    printf "  -> Honcho clone failed %-24s ${C_YELLOW}[WARN]${RESET}\n" ""
+                fi
+            else
+                ( cd "$HONCHO_DIR" && git pull --ff-only >/dev/null 2>&1 ) \
+                    && printf "  -> Honcho repo updated %-24s ${C_GREEN}[ OK ]${RESET}\n" ""
+            fi
+
+            if [ -d "$HONCHO_DIR" ]; then
+                # Seed compose + env from the shipped examples if not already done.
+                [ -f "$HONCHO_DIR/docker-compose.yml" ] || cp "$HONCHO_DIR/docker-compose.yml.example" "$HONCHO_DIR/docker-compose.yml" 2>/dev/null
+                if [ ! -f "$HONCHO_DIR/.env" ] && [ -f "$HONCHO_DIR/.env.template" ]; then
+                    cp "$HONCHO_DIR/.env.template" "$HONCHO_DIR/.env"
+                    # Point Honcho's deriver/dialectic at the local inference engine
+                    # (Ollama's OpenAI-compatible endpoint) instead of a cloud key.
+                    {
+                        echo ""
+                        echo "# --- Local inference (added by imperative-dots installer) ---"
+                        echo "LLM_OPENAI_COMPATIBLE_BASE_URL=http://localhost:11434/v1"
+                        echo "LLM_OPENAI_COMPATIBLE_API_KEY=ollama"
+                    } >> "$HONCHO_DIR/.env"
+                    printf "  -> Honcho .env seeded (local Ollama) %-9s ${C_GREEN}[ OK ]${RESET}\n" ""
+                fi
+
+                echo "  -> Building & starting Honcho stack (first build can take a few minutes)..."
+                if ( cd "$HONCHO_DIR" && $HONCHO_COMPOSE up -d --build ) >/dev/null 2>&1; then
+                    printf "  -> Honcho stack up %-28s ${C_GREEN}[ OK ]${RESET}\n" ""
+                else
+                    printf "  -> Honcho stack failed to start %-15s ${C_YELLOW}[WARN]${RESET}\n" ""
+                    printf "  -> ${DIM}Check: cd ~/honcho && $HONCHO_COMPOSE logs${RESET}\n"
+                fi
+
+                # Wait for the API to answer.
+                echo "  -> Waiting for Honcho API..."
+                for i in $(seq 1 30); do
+                    if curl -fsS -m 1 http://localhost:8000/ >/dev/null 2>&1; then
+                        printf "  -> Honcho responding at :8000 %-17s ${C_GREEN}[ OK ]${RESET}\n" ""
+                        break
+                    fi
+                    sleep 2
+                    [ "$i" -eq 30 ] && printf "  -> Honcho slow to start %-23s ${C_YELLOW}[WARN]${RESET}\n" ""
+                done
+            fi
+        else
+            echo "  -> Skipped Honcho install"
+        fi
+
+        echo "  -> ${C_CYAN}API:${RESET}          http://localhost:8000/  (Hermes cross-session memory)"
+        echo "  -> ${C_CYAN}Repo:${RESET}         ~/honcho/  (managed via $HONCHO_COMPOSE)"
+    fi
+fi
+
+# ==============================================================================
 # AI STACK: Ollama → Hermes → Kavita
-# LiteLLM was removed. Hermes now talks to Ollama directly via its native API,
-# which Hermes treats as an OpenAI-compatible custom provider at /v1.
+# Hermes talks to Ollama directly via its native API, which it treats as an
+# OpenAI-compatible custom provider at /v1.
 # ==============================================================================
 
 # AI STACK: (Ollama OR vLLM-TurboQuant) → Hermes → Kavita
-# LiteLLM was removed. Hermes talks directly to whichever inference engine is
-# active (Ollama for NVIDIA/Intel/CPU, vLLM-TurboQuant for AMD) via that
-# engine's OpenAI-compatible HTTP API.
+# Hermes talks directly to whichever inference engine is active (Ollama for
+# NVIDIA/Intel/CPU, vLLM-TurboQuant for AMD) via that engine's OpenAI-compatible
+# HTTP API.
 # ==============================================================================
 
 if [ "$OPT_AI" = true ] && [ "$USE_VLLM_TURBOQUANT" = true ]; then
@@ -1831,8 +2001,8 @@ if [ "$OPT_AI" = true ]; then
     # Hermes dotfiles live in the repo at .hermes/ and get copied to
     # $HOME/.hermes/. The .env is generated from .env.template with secrets
     # injected; config.yaml has {{PLACEHOLDERS}} sed-replaced based on GPU
-    # vendor. hermes_bridge.sh lives in .config/hypr/scripts/ and is already
-    # deployed by the CONFIG_FOLDERS copy of the hypr directory.
+    # vendor. The AI popup talks to Hermes directly over HTTP (/v1/responses);
+    # there is no bridge script.
     HERMES_REPO="$REPO_DIR/.hermes"
 
     if [ -d "$HERMES_REPO" ]; then
@@ -2010,45 +2180,39 @@ EOF
 
     echo "  -> ${C_CYAN}First-time setup:${RESET} Open ${BOLD}http://localhost:5000${RESET}"
     echo "  -> ${C_CYAN}Library path:${RESET} $KAVITA_LIBRARY (drop books here, mounted as /library inside)"
-    echo "  -> ${C_CYAN}Get API key:${RESET} Account → API Key → paste into ai_config.json"
+    echo "  -> ${C_CYAN}Get API key:${RESET} Account → API Key → paste into config.json"
 
     # ─── 6.9 AI popup config ───────────────────────────────────────────────
-    # Points the popup at whichever inference engine is active. Also exposes
-    # SearXNG and Kavita URLs so the popup widget can query them.
-    AI_CFG="$HOME/.config/hypr/ai_config.json"
+    # Points the popup at the Hermes endpoint. The Chat/Agent toggle appends
+    # chat_path / agent_path to base_url; sessions_path is used for AI search.
+    AI_CFG="$HOME/.config/hypr/config.json"
     if [ ! -f "$AI_CFG" ]; then
         mkdir -p "$(dirname "$AI_CFG")"
         if [ "$USE_VLLM_TURBOQUANT" = true ]; then
-            _ai_api_key="vllm"
-            _ai_model="${VLLM_MODEL:-Qwen/Qwen2.5-7B-Instruct}"
-            _ai_base_url="http://localhost:8000/v1"
-            _ai_native_url="http://localhost:8000"
-            _ai_engine="vllm-turboquant"
+            _ai_model="hermes-agent"
+            _ai_base_url="http://localhost:8642"
         else
-            _ai_api_key="ollama"
-            _ai_model="qwen2.5:7b"
-            _ai_base_url="http://localhost:11434/v1"
-            _ai_native_url="http://localhost:11434"
-            _ai_engine="ollama"
+            _ai_model="hermes-agent"
+            _ai_base_url="http://localhost:8642"
         fi
         cat > "$AI_CFG" <<JSON
 {
-    "inference_engine": "$_ai_engine",
-    "api_key": "$_ai_api_key",
+    "hermes_enabled": true,
+    "hermes_token": "",
     "model": "$_ai_model",
     "base_url": "$_ai_base_url",
-    "ollama_native_url": "$_ai_native_url",
+    "chat_path": "/v1/chat/completions",
+    "agent_path": "/v1/runs",
+    "sessions_path": "/api/sessions",
+    "approval_policy": "ask",
     "ollama_api_key": "",
     "searxng_url": "http://localhost:8888",
     "lichess_token": "",
     "kavita_url": "http://localhost:5000",
     "kavita_api_key": "",
-    "hermes_enabled": true,
-    "hermes_endpoint": "http://localhost:5400/api/agent",
-    "hermes_token": "",
+    "obsidian_vault": "",
     "autobrowse_url": "http://localhost:8080",
-    "autobrowse_token": "$AUTOBROWSE_AUTH_TOKEN",
-    "approval_policy": "ask"
+    "autobrowse_token": "$AUTOBROWSE_AUTH_TOKEN"
 }
 JSON
         chmod 600 "$AI_CFG"
@@ -2321,7 +2485,7 @@ if [ "$OPT_AI" = true ]; then
     echo -e "  ${BOLD}SearXNG:${RESET}    ${C_GREEN}http://localhost:8888${RESET}   (JSON: /search?q=...&format=json)"
     echo -e "  ${BOLD}autobrowse:${RESET} ${C_GREEN}http://localhost:8080${RESET}   (live VNC at :5900)"
     echo -e "  ${BOLD}Kavita:${RESET}     ${C_GREEN}http://localhost:5000${RESET}"
-    echo -e "${DIM}(secrets stored in $VERSION_FILE and $HOME/.config/hypr/ai_config.json)${RESET}\n"
+    echo -e "${DIM}(secrets stored in $VERSION_FILE and $HOME/.config/hypr/config.json)${RESET}\n"
 fi
 
 echo -e "Old configurations backed up to: ${C_CYAN}$BACKUP_DIR${RESET}"
@@ -2349,7 +2513,7 @@ if [ "$USE_VLLM_TURBOQUANT" = true ]; then
 else
     echo -e "  1. ${C_GREEN}ollama pull qwen2.5:7b${RESET}  (or whichever model you want as the default)"
 fi
-echo -e "  2. Edit ${C_GREEN}$HOME/.config/hypr/ai_config.json${RESET} (Lichess + Kavita keys)"
+echo -e "  2. Edit ${C_GREEN}$HOME/.config/hypr/config.json${RESET} (Lichess + Kavita keys)"
 if command -v hermes &>/dev/null; then
     if [ "$USE_VLLM_TURBOQUANT" = true ]; then
         echo -e "  3. Run ${C_GREEN}hermes${RESET} once to confirm config (talks to vLLM-TurboQuant directly)"
