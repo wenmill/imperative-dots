@@ -58,7 +58,8 @@ Item {
     property string vpnStatus: "disconnected" // disconnected, connecting, connected
     property string vpnName: ""
     property string vpnIp: ""
-    property string currentDns: ""
+    property string currentDns: "9.9.9.9"
+    property bool hasCustomDns: false
     property bool editingIp: false
     property bool editingDns: false
     property string editIpText: ""
@@ -504,6 +505,194 @@ Item {
     property real multiTransitionState: (isLogicMultiState && window.currentPower) ? 1.0 : 0.0
     Behavior on multiTransitionState { NumberAnimation { duration: 1200; easing.type: Easing.InOutExpo } }
 
+    // ── DNS / IP editing (in-popup, via nmcli) ──────────────────────────────
+    // Resolve the nmcli connection NAME currently active on the chosen device, so
+    // `nmcli con mod` targets the right profile. Falls back to the saved-network name.
+    function _activeConnName() {
+        if (window.editConnName && window.editConnName !== "") return window.editConnName;
+        if (window.activeMode === "wifi") {
+            let w = window.wifiConnected; if (Array.isArray(w)) w = w[0];
+            if (w && w.ssid) return w.ssid;
+        }
+        if (window.activeMode === "eth" && window.ethConnected && window.ethConnected.id)
+            return window.ethConnected.id;
+        return "";
+    }
+    // Open the IP editor pre-filled with the current value.
+    function handleEditIp() {
+        let conn = window._activeConnName();
+        if (conn === "") { return; }
+        window.editConnName = conn;
+        // Pre-fill with the current IP (strip any /prefix for display) or blank.
+        let cur = "";
+        if (window.activeMode === "eth" && window.ethConnected) cur = window.ethConnected.ip || "";
+        else { let w = window.wifiConnected; if (Array.isArray(w)) w = w[0]; if (w) cur = w.ip || ""; }
+        window.editIpText = cur;
+        window.editingDns = false;
+        window.editingIp = true;
+    }
+    function handleEditDns() {
+        // Right-click: configure the CUSTOM DNS that left-click flips to.
+        window.editDnsText = window.customDns || "";
+        window.editingIp = false;
+        window.editingDns = true;
+    }
+    // Apply IP/DNS by resolving the ACTIVE connection name in-shell (robust — doesn't
+    // depend on QML-tracked names) and reporting the result so we know if it actually
+    // worked (nmcli con mod needs polkit privileges; if it fails we surface it).
+    property string netApplyResult: ""
+
+    // ── DNS quick-toggle (left-click) + custom config (right-click) ─────────
+    // Left-click the DNS node flips between Quad9 (9.9.9.9) and the user's custom DNS.
+    // Right-click opens the editor to set the custom value. Applies with a gentle
+    // reload (no con up) so the active connection doesn't blip.
+    property string customDns: "1.1.1.1"   // default custom until the user sets one
+    readonly property string quad9Dns: "9.9.9.9"
+
+    function flipDns() {
+        // Decide target: if currently on Quad9, switch to custom; else switch to Quad9.
+        var target = (window.currentDns === window.quad9Dns) ? window.customDns : window.quad9Dns;
+        window.applyDnsGentle(target);
+    }
+    // Apply DNS WITHOUT re-activating the connection: set it, then nudge NM to reapply
+    // DNS only. `nmcli dev reapply` re-reads the profile's IP/DNS config on the device
+    // without tearing the link down — no disconnect blip.
+    function applyDnsGentle(dns) {
+        dns = (dns || "").trim();
+        // Update the displayed value IMMEDIATELY so the node shows the new DNS the
+        // instant it's activated, before nmcli/poller catches up.
+        window.currentDns = (dns === "" || dns.toLowerCase() === "auto") ? "Auto" : dns.split(" ")[0];
+        var spec = (dns === "" || dns.toLowerCase() === "auto")
+            ? "ipv4.ignore-auto-dns no ipv4.dns ''"
+            : "ipv4.ignore-auto-dns yes ipv4.dns '" + dns.replace(/'/g, "") + "'";
+        var sh =
+            "CONN=$(nmcli -t -f NAME,TYPE connection show --active | grep -v ':loopback' | head -1 | cut -d: -f1); " +
+            "if [ -z \"$CONN\" ]; then echo 'ERR: no active connection'; exit 1; fi; " +
+            "DEV=$(nmcli -t -f GENERAL.DEVICES connection show \"$CONN\" 2>/dev/null | cut -d: -f2); " +
+            "nmcli con mod \"$CONN\" " + spec + " && " +
+            "{ nmcli dev reapply \"$DEV\" 2>/dev/null || nmcli con up \"$CONN\"; } && echo \"OK: $CONN dns=" + dns + "\"";
+        netApplyProc.command = ["bash", "-c", sh];
+        netApplyProc.running = false; netApplyProc.running = true;
+        window.updateInfoNodes();   // re-render the node label now
+    }
+    function applyIp(val) {
+        val = (val || "").trim();
+        var lc = val.toLowerCase();
+        var sh;
+        if (val === "" || lc === "auto" || lc === "dhcp") {
+            // Back to DHCP: clear any manual address/gateway so routing is restored.
+            sh =
+                "CONN=$(nmcli -t -f NAME,TYPE connection show --active | grep -v ':loopback' | head -1 | cut -d: -f1); " +
+                "if [ -z \"$CONN\" ]; then echo 'ERR: no active connection'; exit 1; fi; " +
+                "nmcli con mod \"$CONN\" ipv4.method auto ipv4.addresses '' ipv4.gateway '' && " +
+                "nmcli con up \"$CONN\" && echo \"OK: $CONN auto\"";
+        } else {
+            // Static IP. CRITICAL: a manual IPv4 needs the correct subnet prefix AND a
+            // gateway or routing breaks (the disconnect bug). If the user didn't supply a
+            // /prefix, reuse the CURRENT prefix; always reuse the CURRENT gateway + DNS so
+            // the connection keeps working. Detect all three from the live device.
+            var userVal = val.replace(/'/g, "");
+            sh =
+                "CONN=$(nmcli -t -f NAME,TYPE connection show --active | grep -v ':loopback' | head -1 | cut -d: -f1); " +
+                "if [ -z \"$CONN\" ]; then echo 'ERR: no active connection'; exit 1; fi; " +
+                "DEV=$(nmcli -t -f GENERAL.DEVICES connection show \"$CONN\" 2>/dev/null | cut -d: -f2); [ -z \"$DEV\" ] && DEV=$(nmcli -t -f DEVICE connection show --active | grep -v '^lo' | head -1); " +
+                "CUR=$(nmcli -t -f IP4.ADDRESS device show \"$DEV\" 2>/dev/null | head -1 | cut -d: -f2); " +
+                "PREFIX=$(echo \"$CUR\" | cut -s -d/ -f2); [ -z \"$PREFIX\" ] && PREFIX=24; " +
+                "GW=$(nmcli -t -f IP4.GATEWAY device show \"$DEV\" 2>/dev/null | head -1 | cut -d: -f2); " +
+                "NEW=\"" + userVal + "\"; case \"$NEW\" in */*) ;; *) NEW=\"$NEW/$PREFIX\";; esac; " +
+                "if [ -n \"$GW\" ]; then " +
+                "nmcli con mod \"$CONN\" ipv4.method manual ipv4.addresses \"$NEW\" ipv4.gateway \"$GW\"; " +
+                "else nmcli con mod \"$CONN\" ipv4.method manual ipv4.addresses \"$NEW\"; fi && " +
+                "nmcli con up \"$CONN\" && echo \"OK: $CONN $NEW gw=$GW\" || echo \"ERR: apply failed\"";
+        }
+        netApplyProc.command = ["bash", "-c", sh];
+        netApplyProc.running = false; netApplyProc.running = true;
+        window.editingIp = false;
+        window._infoRefreshCount = 0; infoRefreshTimer.restart();
+    }
+    function applyDns(val) {
+        // Called by the editor's Apply (right-click flow): save as the CUSTOM DNS,
+        // persist it, switch to it now, and apply gently (no connection blip).
+        val = (val || "").trim();
+        if (val !== "" && val.toLowerCase() !== "auto") {
+            window.customDns = val.replace(/,/g, " ").replace(/\s+/g, " ").split(" ")[0];
+            window.hasCustomDns = true;
+            Quickshell.execDetached(["bash", "-c",
+                "mkdir -p ~/.cache && printf '%s' '" + window.customDns + "' > ~/.cache/qs_custom_dns"]);
+        }
+        window.editingDns = false;
+        window.applyDnsGentle(val === "" ? "auto" : val);
+    }
+    Process {
+        id: netApplyProc
+        command: ["bash", "-c", "true"]
+        stdout: StdioCollector { onStreamFinished: {
+            window.netApplyResult = this.text.trim();
+            window._infoRefreshCount = 0; infoRefreshTimer.restart();
+        } }
+        stderr: StdioCollector { onStreamFinished: {
+            var e = this.text.trim();
+            if (e !== "") window.netApplyResult = "ERR: " + e;
+        } }
+    }
+
+    // Re-read connection info after a change applies. nmcli con up takes a moment, so
+    // poll a few times: re-run the active device poller (updates obj.ip) + DNS read.
+    property int _infoRefreshCount: 0
+    Timer {
+        id: infoRefreshTimer; interval: 1200; repeat: true
+        onTriggered: {
+            window._infoRefreshCount++;
+            if (window.activeMode === "eth") ethPoller.running = true;
+            else if (window.activeMode === "wifi") wifiPoller.running = true;
+            window.dnsReader.running = true;
+            if (window.currentConn) window.updateInfoNodes();
+            if (window._infoRefreshCount >= 3) { stop(); window._infoRefreshCount = 0; }
+        }
+    }
+
+    // Read + watch VPN state. Detects an active VPN connection (TYPE vpn or wireguard)
+    // and updates vpnStatus/vpnName/vpnIp. Referenced by the VPN toggle node + old bar.
+    Process {
+        id: vpnPoller
+        running: true
+        command: ["bash", "-c",
+            "ACT=$(nmcli -t -f NAME,TYPE,DEVICE connection show --active 2>/dev/null | grep -iE ':(vpn|wireguard):' | head -1); " +
+            "if [ -n \"$ACT\" ]; then NAME=$(echo \"$ACT\" | cut -d: -f1); " +
+            "IP=$(nmcli -t -f IP4.ADDRESS connection show \"$NAME\" 2>/dev/null | head -1 | cut -d: -f2); " +
+            "echo \"connected|$NAME|$IP\"; else echo 'disconnected||'; fi"]
+        stdout: StdioCollector { onStreamFinished: {
+            let parts = this.text.trim().split("|");
+            window.vpnStatus = parts[0] || "disconnected";
+            window.vpnName = parts[1] || "";
+            window.vpnIp = parts[2] || "";
+            if (window.currentConn) window.updateInfoNodes();
+        } }
+    }
+    // Poll VPN state at startup and periodically so the node reflects reality.
+    Timer { interval: 5000; running: true; repeat: true; onTriggered: vpnPoller.running = true }
+
+    // Load the saved custom DNS (set via right-click editor) at startup.
+    Process {
+        id: customDnsReader; running: true
+        command: ["bash", "-c", "cat ~/.cache/qs_custom_dns 2>/dev/null"]
+        stdout: StdioCollector { onStreamFinished: {
+            let cd = this.text.trim();
+            if (cd !== "") { window.customDns = cd; window.hasCustomDns = true; }
+        } }
+    }
+
+    Process {
+        id: dnsReader
+        command: ["bash", "-c", "nmcli -t -f IP4.DNS device show 2>/dev/null | head -1 | cut -d: -f2"]
+        stdout: StdioCollector { onStreamFinished: {
+            let d = this.text.trim();
+            // Only reflect the real system DNS once the user has set a custom one.
+            // On a fresh popup (no custom saved), keep showing the 9.9.9.9 default.
+            if (d !== "" && window.hasCustomDns) window.currentDns = d;
+        } }
+    }
+
     function updateInfoNodes() {
         let nodes = [];
         let cList = [];
@@ -531,7 +720,8 @@ Item {
 
                 if (window.activeMode === "eth") {
                     nodes.push({ id: "ip", name: obj.ip || "No IP", icon: "󰩟", action: "Click to edit", isInfoNode: true, isActionable: true, cmdStr: "EDIT_IP", parentIndex: cIndex });
-                    nodes.push({ id: "dns", name: window.currentDns || "Auto", icon: "󰇖", action: "Click to edit", isInfoNode: true, isActionable: true, cmdStr: "EDIT_DNS", parentIndex: cIndex });
+                    nodes.push({ id: "dns", name: window.currentDns || "Auto", icon: "󰇖", action: "Toggle DNS", isInfoNode: true, isActionable: true, cmdStr: "EDIT_DNS", parentIndex: cIndex });
+                    nodes.push({ id: "vpn", name: window.vpnStatus === "connected" ? (window.vpnName || "VPN On") : "VPN Off", icon: window.vpnStatus === "connected" ? "󰦝" : "󰦞", action: "Toggle VPN", isInfoNode: true, isActionable: true, cmdStr: "TOGGLE_VPN", parentIndex: cIndex });
                     nodes.push({ id: "spd", name: obj.speed || "Unknown", icon: "󰓅", action: "Link Speed", isInfoNode: true, isActionable: false, parentIndex: cIndex });
                     nodes.push({ id: "mac", name: obj.mac || "Unknown", icon: "󰒋", action: "MAC Address", isInfoNode: true, isActionable: false, parentIndex: cIndex });
                 } else if (window.activeMode === "wifi") {
@@ -539,7 +729,8 @@ Item {
                     nodes.push({ id: "sig_" + i, name: sigValue, icon: obj.icon || "󰤨", action: "Signal Strength", isInfoNode: true, isActionable: false, parentIndex: cIndex });
                     nodes.push({ id: "sec_" + i, name: obj.security || "Open", icon: "󰦝", action: "Security", isInfoNode: true, isActionable: false, parentIndex: cIndex });
                     if (obj.ip) nodes.push({ id: "ip_" + i, name: obj.ip, icon: "󰩟", action: "Click to edit", isInfoNode: true, isActionable: true, cmdStr: "EDIT_IP", parentIndex: cIndex });
-                    nodes.push({ id: "dns_" + i, name: window.currentDns || "Auto", icon: "󰇖", action: "Click to edit", isInfoNode: true, isActionable: true, cmdStr: "EDIT_DNS", parentIndex: cIndex });
+                    nodes.push({ id: "dns_" + i, name: window.currentDns || "Auto", icon: "󰇖", action: "Toggle DNS", isInfoNode: true, isActionable: true, cmdStr: "EDIT_DNS", parentIndex: cIndex });
+                    nodes.push({ id: "vpn_" + i, name: window.vpnStatus === "connected" ? (window.vpnName || "VPN On") : "VPN Off", icon: window.vpnStatus === "connected" ? "󰦝" : "󰦞", action: "Toggle VPN", isInfoNode: true, isActionable: true, cmdStr: "TOGGLE_VPN", parentIndex: cIndex });
                     if (obj.freq) nodes.push({ id: "freq_" + i, name: obj.freq, icon: "󰖧", action: "Band", isInfoNode: true, isActionable: false, parentIndex: cIndex });
                 } else {
                     nodes.push({ id: "bat_" + obj.mac, name: (obj.battery || "0") + "%", icon: "󰥉", action: "Battery", isInfoNode: true, isActionable: false, parentIndex: cIndex });
@@ -2000,10 +2191,16 @@ Item {
                                     id: floatMa
                                     anchors.fill: parent
                                     hoverEnabled: floatCard.isInteractable
+                                    acceptedButtons: Qt.LeftButton | Qt.RightButton
                                     
                                     cursorShape: (floatCard.triggered || floatCard.isMyBusy || floatCard.renderFill === 1.0 || !floatCard.isInteractable) ? Qt.ArrowCursor : Qt.PointingHandCursor
                                     
-                                    onPressed: { 
+                                    onPressed: function(mouse) {
+                                        // Right-click the DNS node → configure the custom DNS (no fill animation).
+                                        if (mouse.button === Qt.RightButton) {
+                                            if (cmdStr === "EDIT_DNS") window.handleEditDns();
+                                            return;
+                                        }
                                         if (floatCard.isInteractable && !floatCard.triggered && !floatCard.isMyBusy && floatCard.fillLevel === 0.0) {
                                             if (window.pendingWifiId !== "") {
                                                 window.pendingWifiId = ""; window.pendingWifiSsid = "";
@@ -2033,8 +2230,23 @@ Item {
                                         cardFlashAnim.start();
                                         cardBumpAnim.start();
                                         
-                                        if (cmdStr === "EDIT_IP") { window.handleEditIp(); return; }
-                                        if (cmdStr === "EDIT_DNS") { window.handleEditDns(); return; }
+                                        if (cmdStr === "EDIT_IP") { floatCard.triggered = false; drainAnim.start(); window.handleEditIp(); return; }
+                                        if (cmdStr === "EDIT_DNS") { drainAnim.stop(); floatCard.triggered = false; floatCard.fillLevel = 0.0; window.flipDns(); return; }
+                                        if (cmdStr === "TOGGLE_VPN") {
+                                            floatCard.triggered = false; drainAnim.start();
+                                            if (window.vpnStatus === "connected") {
+                                                Quickshell.execDetached(["nmcli", "connection", "down", window.vpnName]);
+                                                window.vpnStatus = "disconnected";
+                                            } else {
+                                                Quickshell.execDetached(["bash", "-c",
+                                                    "VPN=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | grep vpn | head -1 | cut -d: -f1); " +
+                                                    "[ -n \"$VPN\" ] && nmcli connection up \"$VPN\""]);
+                                                window.vpnStatus = "connecting";
+                                            }
+                                            vpnPoller.running = true;
+                                            window._infoRefreshCount = 0; infoRefreshTimer.restart();
+                                            return;
+                                        }
                                         if (cmdStr === "TOGGLE_VIEW") {
                                             window.playSfx("switch.wav");
                                             window.showInfoView = !window.showInfoView;
@@ -2235,90 +2447,6 @@ Item {
                 }
             }
 
-            // ── VPN status bar ──
-            Rectangle {
-                id: vpnBar
-                z: 50
-                width: window.s(200); height: window.s(36)
-                anchors.left: parent.left; anchors.leftMargin: window.s(20)
-                anchors.bottom: parent.bottom; anchors.bottomMargin: window.s(20)
-                radius: window.s(10)
-                color: vpnBarMa.containsMouse ? window.surface1 : window.surface0
-                border.color: window.vpnStatus === "connected" ? Qt.rgba(window.green.r, window.green.g, window.green.b, 0.4) : window.surface1
-                border.width: 1
-                Behavior on color { ColorAnimation { duration: 120 } }
-
-                RowLayout {
-                    anchors.fill: parent; anchors.leftMargin: window.s(10); anchors.rightMargin: window.s(10)
-                    spacing: window.s(8)
-
-                    // VPN icon
-                    Text {
-                        text: window.vpnStatus === "connected" ? "󰦝" : "󰦞"
-                        font.family: "Iosevka Nerd Font"; font.pixelSize: window.s(16)
-                        color: window.vpnStatus === "connected" ? window.green : window.overlay1
-                    }
-
-                    // VPN info
-                    ColumnLayout {
-                        Layout.fillWidth: true; spacing: -1
-                        Text {
-                            text: window.vpnStatus === "connected" ? window.vpnName : "VPN Off"
-                            font.family: "JetBrains Mono"; font.weight: Font.Bold; font.pixelSize: window.s(10)
-                            color: window.vpnStatus === "connected" ? window.text : window.subtext0
-                            elide: Text.ElideRight; Layout.fillWidth: true
-                        }
-                        Text {
-                            visible: window.vpnStatus === "connected" && window.vpnIp !== ""
-                            text: window.vpnIp
-                            font.family: "JetBrains Mono"; font.pixelSize: window.s(8)
-                            color: window.overlay1
-                        }
-                    }
-                }
-
-                MouseArea {
-                    id: vpnBarMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                    onClicked: {
-                        if (window.vpnStatus === "connected") {
-                            Quickshell.execDetached(["nmcli", "connection", "down", window.vpnName]);
-                            window.vpnStatus = "disconnected";
-                        } else {
-                            // Connect to first available VPN
-                            Quickshell.execDetached(["bash", "-c",
-                                "VPN=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | grep vpn | head -1 | cut -d: -f1); " +
-                                "[ -n \"$VPN\" ] && nmcli connection up \"$VPN\""
-                            ]);
-                            window.vpnStatus = "connecting";
-                        }
-                        vpnPoller.running = true;
-                    }
-                }
-            }
-
-            // ── Settings button ──
-            Rectangle {
-                z: 50
-                width: window.s(36); height: window.s(36)
-                anchors.left: vpnBar.right; anchors.leftMargin: window.s(8)
-                anchors.bottom: parent.bottom; anchors.bottomMargin: window.s(20)
-                radius: window.s(10)
-                color: settingsMa.containsMouse ? window.surface1 : window.surface0
-                border.color: settingsMa.containsMouse ? window.mauve : window.surface1; border.width: 1
-                Behavior on color { ColorAnimation { duration: 120 } }
-
-                Text {
-                    anchors.centerIn: parent; text: "󰒓"
-                    font.family: "Iosevka Nerd Font"; font.pixelSize: window.s(18)
-                    color: settingsMa.containsMouse ? window.mauve : window.overlay1
-                    Behavior on color { ColorAnimation { duration: 150 } }
-                }
-                MouseArea {
-                    id: settingsMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                    onClicked: Quickshell.execDetached(["bash", "-c", "nm-connection-editor &"])
-                }
-            }
-
             // ── IP edit overlay ──
             Rectangle {
                 visible: window.editingIp
@@ -2409,13 +2537,9 @@ Item {
                 id: powerToggleContainer
                 z: 100
 
-                // FIXED: Replaced direct Behavior on x/y with an interpolation value.
-                // This completely removes lag and overshooting when the parent window resizes/morphs.
-                property real pwrMorph: window.currentPower ? 1.0 : 0.0
-                Behavior on pwrMorph {
-                    enabled: window.powerAnimAllowed;
-                    NumberAnimation { duration: 800; easing.type: Easing.InOutQuint }
-                }
+                // Repurposed as a SETTINGS button: pinned to the corner (no power morph),
+                // opens the NetworkManager GUI. The radio on/off toggle was removed.
+                property real pwrMorph: 1.0
 
                 width: window.s(160) + (window.s(48) - window.s(160)) * pwrMorph
                 height: width
@@ -2452,18 +2576,18 @@ Item {
 
                     gradient: Gradient {
                         orientation: Gradient.Vertical
-                        GradientStop { position: 0.0; color: window.currentPower ? "transparent" : window.surface1 }
-                        GradientStop { position: 1.0; color: window.currentPower ? "transparent" : window.crust }
+                        GradientStop { position: 0.0; color: window.surface1 }
+                        GradientStop { position: 1.0; color: window.surface0 }
                     }
 
-                    border.color: window.currentPowerPending ? window.activeColor : (window.currentPower ? "transparent" : window.surface2)
+                    border.color: pwrMa.containsMouse ? window.mauve : window.surface2
                     border.width: window.s(2)
                     Behavior on border.color { enabled: window.powerAnimAllowed; ColorAnimation { duration: 800; easing.type: Easing.InOutQuint } }
 
                     Rectangle {
                         anchors.fill: parent
                         radius: parent.radius
-                        opacity: window.currentPower ? 1.0 : 0.0
+                        opacity: 0.0
                         Behavior on opacity { enabled: window.powerAnimAllowed; NumberAnimation { duration: 800; easing.type: Easing.InOutQuint } }
                         gradient: Gradient {
                             orientation: Gradient.Horizontal
@@ -2476,11 +2600,10 @@ Item {
                         id: pwrIcon
                         anchors.centerIn: parent
                         font.family: "Iosevka Nerd Font"
-                        font.pixelSize: window.currentPower ? window.s(22) : window.s(64)
-                        color: window.currentPower ? window.crust : window.text
-                        text: window.currentPowerPending ? "󰑮" : ""
-                        Behavior on font.pixelSize { enabled: window.powerAnimAllowed; NumberAnimation { duration: 800; easing.type: Easing.InOutQuint } }
-                        Behavior on color { enabled: window.powerAnimAllowed; ColorAnimation { duration: 800; easing.type: Easing.InOutQuint } }
+                        font.pixelSize: window.s(20)
+                        color: pwrMa.containsMouse ? window.mauve : window.text
+                        text: "󰒓"
+                        Behavior on color { ColorAnimation { duration: 150 } }
 
                         RotationAnimation {
                             target: pwrIcon
@@ -2500,42 +2623,7 @@ Item {
                         anchors.fill: parent
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
-                        onClicked: {
-                            if (window.pendingWifiId !== "") { window.pendingWifiId = ""; window.pendingWifiSsid = ""; }
-                            
-                            if (window.activeMode === "eth") {
-                                if (window.ethPowerPending) return;
-                                window.expectedEthPower = window.ethPower === "on" ? "off" : "on";
-                                window.ethPowerPending = true;
-                                if (window.expectedEthPower === "on") window.playSfx("power_on.wav"); else window.playSfx("power_off.wav");
-                                ethPendingReset.restart();
-                                window.ethPower = window.expectedEthPower; 
-                                let targetDev = window.ethDeviceName !== "" ? window.ethDeviceName : (window.currentCores[0] ? window.currentCores[0].id : "");
-                                if (targetDev !== "") {
-                                    if (window.expectedEthPower === "on") Quickshell.execDetached(["nmcli", "device", "connect", targetDev]);
-                                    else Quickshell.execDetached(["nmcli", "device", "disconnect", targetDev]);
-                                }
-                                ethPoller.running = true;
-                            } else if (window.activeMode === "wifi") {
-                                if (window.wifiPowerPending) return;
-                                window.expectedWifiPower = window.wifiPower === "on" ? "off" : "on";
-                                window.wifiPowerPending = true;
-                                if (window.expectedWifiPower === "on") window.playSfx("power_on.wav"); else window.playSfx("power_off.wav");
-                                wifiPendingReset.restart();
-                                window.wifiPower = window.expectedWifiPower;
-                                Quickshell.execDetached(["nmcli", "radio", "wifi", window.wifiPower]);
-                                wifiPoller.running = true;
-                            } else {
-                                if (window.btPowerPending) return;
-                                window.expectedBtPower = window.btPower === "on" ? "off" : "on";
-                                window.btPowerPending = true;
-                                if (window.expectedBtPower === "on") window.playSfx("power_on.wav"); else window.playSfx("power_off.wav");
-                                btPendingReset.restart();
-                                window.btPower = window.expectedBtPower;
-                                Quickshell.execDetached(["bash", window.scriptsDir + "/bluetooth_panel_logic.sh", "--toggle"]);
-                                btPoller.running = true;
-                            }
-                        }
+                        onClicked: Quickshell.execDetached(["bash", "-c", "nm-connection-editor &"])
                     }
                 }
             }
