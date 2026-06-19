@@ -530,11 +530,11 @@
       "command": "~/.config/hypr/scripts/update_notifier.sh"
     }
   ],
-  "floatingBottomHeight": 539.55859375,
-  "corrChessGameId": "BwwUe9SR",
-  "corrChessIsWhite": false,
+  "floatingBottomHeight": 204.5,
+  "corrChessGameId": "i7FDGMSx",
+  "corrChessIsWhite": true,
   "corrChessMyTurn": false,
-  "corrChessFen": "3r2k1/pp3pp1/4p2p/3nP3/8/3Q2P1/P4P1P/2B1r1K1 w - - 1 26",
+  "corrChessFen": "r1bqkbnr/pppppppp/2n5/8/3PP3/8/PPP2PPP/RNBQKBNR b KQkq - 0 2",
   "hermesWebSearch": true,
   "hermesHomeAssistant": true
 }
